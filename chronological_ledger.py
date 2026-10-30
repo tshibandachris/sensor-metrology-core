@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import math
 import os
 from contextlib import contextmanager
@@ -24,6 +25,8 @@ JsonValue: TypeAlias = (
 )
 JsonObject: TypeAlias = dict[str, JsonValue]
 RecordKind: TypeAlias = Literal["baseline", "outcome"]
+
+LOGGER = logging.getLogger(__name__)
 
 GENESIS_HASH = "0" * 64
 SCHEMA_VERSION = 1
@@ -529,6 +532,12 @@ class ChronologicalLedgerManager:
             if existing is not None:
                 existing_record = existing["record"]
                 if existing_record.get("payload") == payload:
+                    LOGGER.info(
+                        "Idempotent replay skipped: index=%s key=%s record_id=%s",
+                        index_key[0],
+                        index_key[1],
+                        existing_record.get("record_id"),
+                    )
                     return "already_exists"
                 raise DuplicateConflictError(
                     f"Composite key {index_key[0]} already exists with "
