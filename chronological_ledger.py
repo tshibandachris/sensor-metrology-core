@@ -12,9 +12,10 @@ import hmac
 import json
 import math
 import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, TypeAlias
+from typing import Any, Iterator, Literal, TypeAlias
 
 
 JsonValue: TypeAlias = (
@@ -380,6 +381,38 @@ class ChronologicalLedgerManager:
 
         return records, composite_index, baselines, last_timestamp, previous_hash
 
+
+    @contextmanager
+    def _writer_lock(self) -> Iterator[None]:
+        """Acquire an advisory process lock for the complete append transaction."""
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.ledger_path.with_name(
+            self.ledger_path.name + ".writer.lock"
+        )
+        with lock_path.open("a+b") as lock_stream:
+            if os.name == "nt":
+                import msvcrt
+
+                lock_stream.seek(0, os.SEEK_END)
+                if lock_stream.tell() == 0:
+                    lock_stream.write(b"\\0")
+                    lock_stream.flush()
+                lock_stream.seek(0)
+                msvcrt.locking(lock_stream.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    lock_stream.seek(0)
+                    msvcrt.locking(lock_stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
     def verify(self) -> int:
         """Verify every line, hash link, timestamp, index, and baseline reference."""
         records, _, _, _, _ = self._load_verified()
@@ -452,77 +485,78 @@ class ChronologicalLedgerManager:
                 baseline_ref, "baseline_ref"
             )
 
-        (
-            existing_records,
-            composite_index,
-            baselines,
-            last_timestamp,
-            previous_hash,
-        ) = self._load_verified()
+        with self._writer_lock():
+            (
+                existing_records,
+                composite_index,
+                baselines,
+                last_timestamp,
+                previous_hash,
+            ) = self._load_verified()
 
-        if record_type == "outcome":
-            if baseline_ref not in baselines:
-                raise InvalidRecordError(
-                    "Outcome rejected: baseline_ref does not identify a "
-                    "previously verified baseline."
+            if record_type == "outcome":
+                if baseline_ref not in baselines:
+                    raise InvalidRecordError(
+                        "Outcome rejected: baseline_ref does not identify a "
+                        "previously verified baseline."
+                    )
+                if baselines[baseline_ref].get("target_id") != target_id:
+                    raise InvalidRecordError(
+                        "Outcome target_id must match the referenced baseline."
+                    )
+
+            record: dict[str, Any] = {
+                "schema_version": SCHEMA_VERSION,
+                "record_type": record_type,
+                "record_id": record_id,
+                "target_id": target_id,
+                "execution_version": execution_version,
+                "event_timestamp": event_timestamp,
+                "baseline_ref": baseline_ref,
+                "payload": payload,
+            }
+            index_key = self._composite_index(record)
+            existing = composite_index.get(index_key)
+
+            if existing is not None:
+                existing_record = existing["record"]
+                if existing_record.get("payload") == payload:
+                    return "already_exists"
+                raise DuplicateConflictError(
+                    f"Composite key {index_key[0]} already exists with "
+                    "different business payload."
                 )
-            if baselines[baseline_ref].get("target_id") != target_id:
-                raise InvalidRecordError(
-                    "Outcome target_id must match the referenced baseline."
+
+            existing_ids = {
+                item["record"]["record_id"] for item in existing_records
+            }
+            if record_id in existing_ids:
+                raise DuplicateConflictError(
+                    f"record_id {record_id!r} has already been used."
                 )
 
-        record: dict[str, Any] = {
-            "schema_version": SCHEMA_VERSION,
-            "record_type": record_type,
-            "record_id": record_id,
-            "target_id": target_id,
-            "execution_version": execution_version,
-            "event_timestamp": event_timestamp,
-            "baseline_ref": baseline_ref,
-            "payload": payload,
-        }
-        index_key = self._composite_index(record)
-        existing = composite_index.get(index_key)
+            if last_timestamp is not None and timestamp < last_timestamp:
+                raise InvalidRecordError(
+                    "Retroactive append rejected: event_timestamp is older "
+                    "than the latest ledger timestamp."
+                )
 
-        if existing is not None:
-            existing_record = existing["record"]
-            if existing_record.get("payload") == payload:
-                return "already_exists"
-            raise DuplicateConflictError(
-                f"Composite key {index_key[0]} already exists with "
-                "different business payload."
-            )
+            record_hash = self._record_hash(record)
+            chain_hash = self._chain_hash(previous_hash, record_hash)
+            envelope: dict[str, Any] = {
+                "record": record,
+                "record_hash": record_hash,
+                "previous_hash": previous_hash,
+                "chain_hash": chain_hash,
+                "signature": self._signature(chain_hash),
+            }
+            encoded_line = _canonical_json(envelope) + b"\n"
 
-        existing_ids = {
-            item["record"]["record_id"] for item in existing_records
-        }
-        if record_id in existing_ids:
-            raise DuplicateConflictError(
-                f"record_id {record_id!r} has already been used."
-            )
+            self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+            # Single-writer contract: callers must serialize concurrent appends.
+            with self.ledger_path.open("ab") as stream:
+                stream.write(encoded_line)
+                stream.flush()
+                os.fsync(stream.fileno())
 
-        if last_timestamp is not None and timestamp < last_timestamp:
-            raise InvalidRecordError(
-                "Retroactive append rejected: event_timestamp is older "
-                "than the latest ledger timestamp."
-            )
-
-        record_hash = self._record_hash(record)
-        chain_hash = self._chain_hash(previous_hash, record_hash)
-        envelope: dict[str, Any] = {
-            "record": record,
-            "record_hash": record_hash,
-            "previous_hash": previous_hash,
-            "chain_hash": chain_hash,
-            "signature": self._signature(chain_hash),
-        }
-        encoded_line = _canonical_json(envelope) + b"\n"
-
-        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
-        # Single-writer contract: callers must serialize concurrent appends.
-        with self.ledger_path.open("ab") as stream:
-            stream.write(encoded_line)
-            stream.flush()
-            os.fsync(stream.fileno())
-
-        return "appended"
+            return "appended"
