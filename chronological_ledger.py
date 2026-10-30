@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Append-only, single-writer chronological JSONL ledger.
 
-The ledger is a tamper-evident stream, not a transactional multi-writer database.
+The ledger is a tamper-evident stream, not a transactional database. Appends
+are serialized with an advisory operating-system process lock.
 Keep HMAC keys outside the repository and ledger directory.
 """
 
@@ -395,7 +396,7 @@ class ChronologicalLedgerManager:
 
                 lock_stream.seek(0, os.SEEK_END)
                 if lock_stream.tell() == 0:
-                    lock_stream.write(b"\\0")
+                    lock_stream.write(b"\0")
                     lock_stream.flush()
                 lock_stream.seek(0)
                 msvcrt.locking(lock_stream.fileno(), msvcrt.LK_LOCK, 1)
@@ -553,7 +554,7 @@ class ChronologicalLedgerManager:
             encoded_line = _canonical_json(envelope) + b"\n"
 
             self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
-            # Single-writer contract: callers must serialize concurrent appends.
+            # The advisory lock serializes cooperating writers on this host.
             with self.ledger_path.open("ab") as stream:
                 stream.write(encoded_line)
                 stream.flush()
