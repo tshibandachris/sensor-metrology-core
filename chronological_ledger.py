@@ -104,8 +104,8 @@ def _assert_json_value(value: object, location: str) -> JsonValue:
     if isinstance(value, list):
         result: list[JsonValue] = []
         for index in range(len(value)):
-            item: object = value[index]
-            result.append(_assert_json_value(item, f"{location}[{index}]"))
+            list_item: object = value[index]
+            result.append(_assert_json_value(list_item, f"{location}[{index}]"))
         return result
     if isinstance(value, dict):
         result_object: JsonObject = {}
@@ -114,8 +114,10 @@ def _assert_json_value(value: object, location: str) -> JsonValue:
                 raise InvalidRecordError(
                     f"{location} contains a non-string object key."
                 )
-            item: object = value[key]
-            result_object[key] = _assert_json_value(item, f"{location}.{key}")
+            object_value: object = value[key]
+            result_object[key] = _assert_json_value(
+                object_value, f"{location}.{key}"
+            )
         return result_object
     raise InvalidRecordError(
         f"{location} contains unsupported type {type(value).__name__}."
