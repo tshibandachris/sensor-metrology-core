@@ -100,6 +100,19 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
         self.assertEqual(self.ledger.verify(), 1)
         self.assertEqual(len(self.ledger_path.read_text().splitlines()), 1)
 
+    def test_outcome_target_must_match_baseline(self) -> None:
+        self.append_baseline()
+        with self.assertRaises(InvalidRecordError):
+            self.ledger.append_outcome(
+                record_id="outcome-wrong-target",
+                target_id="sensor-OTHER",
+                execution_version="build-a1",
+                event_timestamp="2026-10-30T08:05:00Z",
+                baseline_ref="baseline-001",
+                payload={"pressure_pa": 101400},
+            )
+        self.assertEqual(self.ledger.verify(), 1)
+
     def test_orphan_outcome_is_rejected(self) -> None:
         with self.assertRaises(InvalidRecordError):
             self.ledger.append_outcome(
