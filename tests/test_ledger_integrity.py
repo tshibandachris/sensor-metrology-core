@@ -115,9 +115,13 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
             )
         self.assertEqual(self.ledger.verify(), 2)
 
-    def test_exact_idempotent_replay_is_skipped(self) -> None:
+    def test_exact_idempotent_replay_is_skipped_with_trace(self) -> None:
         self.assertEqual(self.append_baseline(), "appended")
-        self.assertEqual(self.append_baseline(), "already_exists")
+        with self.assertLogs("chronological_ledger", level="INFO") as captured:
+            self.assertEqual(self.append_baseline(), "already_exists")
+        self.assertTrue(
+            any("Idempotent replay skipped" in message for message in captured.output)
+        )
         self.assertEqual(self.ledger.verify(), 1)
         self.assertEqual(len(self.ledger_path.read_text().splitlines()), 1)
 
