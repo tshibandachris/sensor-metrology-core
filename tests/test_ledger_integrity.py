@@ -188,5 +188,60 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
             self.ledger.verify()
 
 
+    def test_reordering_records_is_detected(self) -> None:
+        self.append_baseline()
+        self.ledger.append_baseline(
+            record_id="baseline-002",
+            target_id="sensor-002",
+            execution_version="build-a1",
+            event_timestamp="2026-10-30T08:01:00Z",
+            payload={"pressure_pa": 100900},
+        )
+        lines = self.ledger_path.read_bytes().splitlines(keepends=True)
+        self.ledger_path.write_bytes(lines[1] + lines[0])
+        with self.assertRaises(IntegrityError):
+            self.ledger.verify()
+
+    def test_removing_an_interior_record_is_detected(self) -> None:
+        self.append_baseline()
+        self.ledger.append_baseline(
+            record_id="baseline-002",
+            target_id="sensor-002",
+            execution_version="build-a1",
+            event_timestamp="2026-10-30T08:01:00Z",
+            payload={"pressure_pa": 100900},
+        )
+        self.ledger.append_baseline(
+            record_id="baseline-003",
+            target_id="sensor-003",
+            execution_version="build-a1",
+            event_timestamp="2026-10-30T08:02:00Z",
+            payload={"pressure_pa": 100800},
+        )
+        lines = self.ledger_path.read_bytes().splitlines(keepends=True)
+        self.ledger_path.write_bytes(lines[0] + lines[2])
+        with self.assertRaises(IntegrityError):
+            self.ledger.verify()
+
+    def test_incomplete_final_jsonl_line_is_rejected(self) -> None:
+        self.append_baseline()
+        with self.ledger_path.open("ab") as stream:
+            stream.write(b'{"record":')
+        with self.assertRaises(IntegrityError):
+            self.ledger.verify()
+
+    def test_record_id_cannot_be_reused_for_another_composite_key(self) -> None:
+        self.append_baseline()
+        with self.assertRaises(DuplicateConflictError):
+            self.ledger.append_baseline(
+                record_id="baseline-001",
+                target_id="sensor-002",
+                execution_version="build-a1",
+                event_timestamp="2026-10-30T08:01:00Z",
+                payload={"pressure_pa": 100900},
+            )
+        self.assertEqual(self.ledger.verify(), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
