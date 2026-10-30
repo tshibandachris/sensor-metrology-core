@@ -415,9 +415,10 @@ class ChronologicalLedgerManager:
                     fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
 
     def verify(self) -> int:
-        """Verify every line, hash link, timestamp, index, and baseline reference."""
-        records, _, _, _, _ = self._load_verified()
-        return len(records)
+        """Verify a stable snapshot of every record and its chain."""
+        with self._writer_lock():
+            records, _, _, _, _ = self._load_verified()
+            return len(records)
 
     def append_baseline(
         self,
