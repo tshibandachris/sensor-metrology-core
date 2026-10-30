@@ -94,6 +94,27 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
             )
         self.assertEqual(self.ledger.verify(), 1)
 
+    def test_outcome_composite_key_conflicts_on_payload_change(self) -> None:
+        self.append_baseline()
+        self.ledger.append_outcome(
+            record_id="outcome-001",
+            target_id="sensor-001",
+            execution_version="build-a1",
+            event_timestamp="2026-10-30T08:05:00Z",
+            baseline_ref="baseline-001",
+            payload={"pressure_pa": 101410},
+        )
+        with self.assertRaises(DuplicateConflictError):
+            self.ledger.append_outcome(
+                record_id="outcome-replay",
+                target_id="sensor-001",
+                execution_version="build-a1",
+                event_timestamp="2026-10-30T08:05:00Z",
+                baseline_ref="baseline-001",
+                payload={"pressure_pa": 101411},
+            )
+        self.assertEqual(self.ledger.verify(), 2)
+
     def test_exact_idempotent_replay_is_skipped(self) -> None:
         self.assertEqual(self.append_baseline(), "appended")
         self.assertEqual(self.append_baseline(), "already_exists")
