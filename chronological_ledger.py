@@ -392,19 +392,25 @@ class ChronologicalLedgerManager:
         )
         with lock_path.open("a+b") as lock_stream:
             if os.name == "nt":
-                import msvcrt
+                # msvcrt's Windows-only API is not fully described by all
+                # typeshed versions. Keep this platform-specific boundary Any.
+                msvcrt_module: Any = __import__("msvcrt")
 
                 lock_stream.seek(0, os.SEEK_END)
                 if lock_stream.tell() == 0:
-                    lock_stream.write(b"\0")
+                    lock_stream.write(b"\\0")
                     lock_stream.flush()
                 lock_stream.seek(0)
-                msvcrt.locking(lock_stream.fileno(), msvcrt.LK_LOCK, 1)
+                msvcrt_module.locking(
+                    lock_stream.fileno(), msvcrt_module.LK_LOCK, 1
+                )
                 try:
                     yield
                 finally:
                     lock_stream.seek(0)
-                    msvcrt.locking(lock_stream.fileno(), msvcrt.LK_UNLCK, 1)
+                    msvcrt_module.locking(
+                        lock_stream.fileno(), msvcrt_module.LK_UNLCK, 1
+                    )
             else:
                 import fcntl
 
