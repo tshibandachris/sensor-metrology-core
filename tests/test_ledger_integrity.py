@@ -4,7 +4,6 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any
 
 from chronological_ledger import (
     GENESIS_HASH,
@@ -37,6 +36,18 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
             payload={"pressure_pa": 101325, "calibration": "initial"},
         )
 
+    @staticmethod
+    def _load_json_object(line: str) -> dict[str, object]:
+        value: object = json.loads(line)
+        if not isinstance(value, dict):
+            raise AssertionError("Expected a JSON object.")
+        result: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise AssertionError("Expected string JSON keys.")
+            result[key] = item
+        return result
+
     def test_baseline_to_outcome_sequential_chain(self) -> None:
         self.assertEqual(self.append_baseline(), "appended")
         result = self.ledger.append_outcome(
@@ -51,22 +62,22 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
         self.assertEqual(self.ledger.verify(), 2)
 
         lines = self.ledger_path.read_text(encoding="utf-8").splitlines()
-        first: dict[str, Any] = json.loads(lines[0])
-        second: dict[str, Any] = json.loads(lines[1])
+        first = self._load_json_object(lines[0])
+        second = self._load_json_object(lines[1])
 
         self.assertEqual(first["previous_hash"], GENESIS_HASH)
         self.assertEqual(second["previous_hash"], first["chain_hash"])
         self.assertNotEqual(first["chain_hash"], second["chain_hash"])
         self.assertIsNotNone(first["signature"])
         self.assertIsNotNone(second["signature"])
-        self.assertEqual(first["record"]["record_type"], "baseline")
-        self.assertEqual(second["record"]["record_type"], "outcome")
+
+        first_record = self._load_json_object(json.dumps(first["record"]))
+        second_record = self._load_json_object(json.dumps(second["record"]))
+        self.assertEqual(first_record["record_type"], "baseline")
+        self.assertEqual(second_record["record_type"], "outcome")
+        self.assertEqual(second_record["baseline_ref"], first_record["record_id"])
         self.assertEqual(
-            second["record"]["baseline_ref"],
-            first["record"]["record_id"],
-        )
-        self.assertEqual(
-            first["record"]["payload"],
+            first_record["payload"],
             {"pressure_pa": 101325, "calibration": "initial"},
         )
 
@@ -155,7 +166,6 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
         original = self.ledger_path.read_text(encoding="utf-8")
         tampered = original.replace("101325", "101326")
         self.ledger_path.write_text(tampered, encoding="utf-8")
-
         with self.assertRaises(IntegrityError):
             self.ledger.verify()
 
@@ -167,6 +177,15 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
         )
         with self.assertRaises(IntegrityError):
             wrong_key_ledger.verify()
+
+    def test_deeply_nested_duplicate_json_keys_are_rejected(self) -> None:
+        malformed_line = (
+            b'{"record":{"payload":{"outer":{"middle":{"inner":'
+            b'{"measurement":1,"measurement":2}}}}}}\n'
+        )
+        self.ledger_path.write_bytes(malformed_line)
+        with self.assertRaises(IntegrityError):
+            self.ledger.verify()
 
 
 if __name__ == "__main__":
