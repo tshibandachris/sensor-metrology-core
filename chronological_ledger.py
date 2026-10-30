@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-"""Append-only, single-writer chronological JSONL ledger.
-
-The ledger is a tamper-evident stream, not a transactional database. Appends
-are serialized with an advisory operating-system process lock.
-Keep HMAC keys outside the repository and ledger directory.
-"""
+"""Append-only, single-writer chronological JSONL ledger."""
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import importlib
 import json
 import logging
 import math
@@ -17,8 +13,7 @@ import os
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Literal, TypeAlias
-
+from typing import Iterator, Literal, Protocol, TypeAlias, cast
 
 JsonValue: TypeAlias = (
     str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
@@ -27,7 +22,6 @@ JsonObject: TypeAlias = dict[str, JsonValue]
 RecordKind: TypeAlias = Literal["baseline", "outcome"]
 
 LOGGER = logging.getLogger(__name__)
-
 GENESIS_HASH = "0" * 64
 SCHEMA_VERSION = 1
 BASELINE_INDEX = "b_target_version_timestamp"
@@ -54,11 +48,19 @@ class DuplicateJsonKeyError(ValueError):
     """A JSON object contains a repeated key."""
 
 
-def _reject_duplicate_json_keys(
-    pairs: list[tuple[str, Any]],
-) -> dict[str, Any]:
+class WindowsLockable(Protocol):
+    """Minimal interface required from the Windows msvcrt module."""
+
+    LK_LOCK: int
+    LK_UNLCK: int
+
+    def locking(self, fd: int, mode: int, nbytes: int) -> None:
+        """Lock or unlock a byte range in an open file descriptor."""
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     """Reject duplicate keys at every JSON object depth."""
-    result: dict[str, Any] = {}
+    result: dict[str, object] = {}
     for key, value in pairs:
         if key in result:
             raise DuplicateJsonKeyError(f"Duplicate JSON key: {key}")
@@ -71,34 +73,56 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"Non-standard JSON numeric constant: {value}")
 
 
-def _validate_json_value(value: Any, location: str = "payload") -> None:
-    """Validate strict JSON-compatible values without coercing Python objects."""
+def assert_json_object(val: object) -> JsonObject:
+    """Recursively validate and rebuild a strict JSON object.
+
+    Booleans are valid JSON values, but are never accepted as integer schema
+    discriminators by the ledger's record validation.
+    """
+    if not isinstance(val, dict):
+        raise InvalidRecordError("JSON envelope or record must be an object.")
+
+    result: JsonObject = {}
+    for key in val:
+        if not isinstance(key, str):
+            raise InvalidRecordError("JSON objects must have string keys.")
+        raw_value: object = val[key]
+        result[key] = _assert_json_value(raw_value, key)
+    return result
+
+
+def _assert_json_value(value: object, location: str) -> JsonValue:
+    """Validate one JSON value recursively and return a typed copy."""
     if value is None or isinstance(value, (str, bool, int)):
-        return
+        return value
     if isinstance(value, float):
         if not math.isfinite(value):
             raise InvalidRecordError(
                 f"{location} contains a non-finite floating-point value."
             )
-        return
+        return value
     if isinstance(value, list):
-        for index, item in enumerate(value):
-            _validate_json_value(item, f"{location}[{index}]")
-        return
+        result: list[JsonValue] = []
+        for index in range(len(value)):
+            item: object = value[index]
+            result.append(_assert_json_value(item, f"{location}[{index}]"))
+        return result
     if isinstance(value, dict):
-        for key, item in value.items():
+        result_object: JsonObject = {}
+        for key in value:
             if not isinstance(key, str):
                 raise InvalidRecordError(
                     f"{location} contains a non-string object key."
                 )
-            _validate_json_value(item, f"{location}.{key}")
-        return
+            item: object = value[key]
+            result_object[key] = _assert_json_value(item, f"{location}.{key}")
+        return result_object
     raise InvalidRecordError(
         f"{location} contains unsupported type {type(value).__name__}."
     )
 
 
-def _canonical_json(value: Any) -> bytes:
+def _canonical_json(value: JsonValue) -> bytes:
     """Return deterministic UTF-8 JSON bytes."""
     try:
         text = json.dumps(
@@ -115,7 +139,7 @@ def _canonical_json(value: Any) -> bytes:
 
 def _parse_utc_timestamp(value: str) -> datetime:
     """Parse a strict UTC ISO-8601 timestamp ending in Z."""
-    if not isinstance(value, str) or not value.endswith("Z"):
+    if not value.endswith("Z"):
         raise InvalidRecordError(
             "event_timestamp must be an ISO-8601 UTC string ending in Z."
         )
@@ -135,21 +159,7 @@ def _sha256_hex(data: bytes) -> str:
 
 
 class ChronologicalLedgerManager:
-    """Manage a verifiable append-only JSONL ledger with one active writer.
-
-    Baseline uniqueness:
-        (target_id, execution_version, event_timestamp)
-
-    Outcome uniqueness:
-        (baseline_ref, execution_version, event_timestamp)
-
-    A replay with the same composite key and same business payload is skipped.
-    Reusing a composite key with different business payload raises
-    DuplicateConflictError. Record identifiers are globally unique.
-
-    The class deliberately does not claim multi-process locking. The caller
-    must guarantee that only one process writes to a given ledger at a time.
-    """
+    """Manage a verifiable append-only JSONL ledger with one active writer."""
 
     def __init__(
         self,
@@ -167,55 +177,49 @@ class ChronologicalLedgerManager:
 
     @staticmethod
     def _chain_hash(previous_hash: str, record_hash: str) -> str:
-        material = f"{previous_hash}:{record_hash}".encode("ascii")
-        return _sha256_hex(material)
+        return _sha256_hex(f"{previous_hash}:{record_hash}".encode("ascii"))
 
     def _signature(self, chain_hash: str) -> str | None:
         if self._hmac_secret is None:
             return None
         return hmac.new(
-            self._hmac_secret,
-            chain_hash.encode("ascii"),
-            hashlib.sha256,
+            self._hmac_secret, chain_hash.encode("ascii"), hashlib.sha256
         ).hexdigest()
 
     @staticmethod
-    def _composite_index(
-        record: dict[str, Any],
-    ) -> tuple[str, tuple[str, str, str]]:
-        kind = record["record_type"]
-        version = record["execution_version"]
-        timestamp = record["event_timestamp"]
-        if kind == "baseline":
-            return (
-                BASELINE_INDEX,
-                (record["target_id"], version, timestamp),
-            )
-        return (
-            OUTCOME_INDEX,
-            (record["baseline_ref"], version, timestamp),
-        )
-
-    @staticmethod
-    def _validate_non_empty_string(value: Any, field: str) -> str:
+    def _required_string(record: JsonObject, field: str) -> str:
+        value = record.get(field)
         if not isinstance(value, str) or not value.strip():
             raise InvalidRecordError(f"{field} must be a non-empty string.")
         return value
 
+    @classmethod
+    def _composite_index(
+        cls, record: JsonObject
+    ) -> tuple[str, tuple[str, str, str]]:
+        kind = record.get("record_type")
+        version = cls._required_string(record, "execution_version")
+        timestamp = cls._required_string(record, "event_timestamp")
+        if kind == "baseline":
+            target_id = cls._required_string(record, "target_id")
+            return BASELINE_INDEX, (target_id, version, timestamp)
+        if kind == "outcome":
+            baseline_ref = cls._required_string(record, "baseline_ref")
+            return OUTCOME_INDEX, (baseline_ref, version, timestamp)
+        raise InvalidRecordError("record_type must be baseline or outcome.")
+
     def _load_verified(
         self,
     ) -> tuple[
-        list[dict[str, Any]],
-        dict[tuple[str, tuple[str, str, str]], dict[str, Any]],
-        dict[str, dict[str, Any]],
+        list[JsonObject],
+        dict[tuple[str, tuple[str, str, str]], JsonObject],
+        dict[str, JsonObject],
         datetime | None,
         str,
     ]:
-        records: list[dict[str, Any]] = []
-        composite_index: dict[
-            tuple[str, tuple[str, str, str]], dict[str, Any]
-        ] = {}
-        baselines: dict[str, dict[str, Any]] = {}
+        records: list[JsonObject] = []
+        composite_index: dict[tuple[str, tuple[str, str, str]], JsonObject] = {}
+        baselines: dict[str, JsonObject] = {}
         record_ids: set[str] = set()
         previous_hash = GENESIS_HASH
         last_timestamp: datetime | None = None
@@ -223,68 +227,54 @@ class ChronologicalLedgerManager:
         if not self.ledger_path.exists():
             return records, composite_index, baselines, last_timestamp, previous_hash
 
-        try:
-            stream = self.ledger_path.open("rb")
-        except OSError:
-            raise
-
-        with stream:
+        with self.ledger_path.open("rb") as stream:
             for line_number, raw_line in enumerate(stream, start=1):
                 if not raw_line.endswith(b"\n"):
                     raise IntegrityError(
                         f"Incomplete JSONL line at line {line_number}."
                     )
                 try:
-                    envelope = json.loads(
+                    decoded: object = json.loads(
                         raw_line.decode("utf-8"),
                         object_pairs_hook=_reject_duplicate_json_keys,
                         parse_constant=_reject_json_constant,
                     )
+                    envelope = assert_json_object(decoded)
                 except (
                     UnicodeDecodeError,
                     json.JSONDecodeError,
                     DuplicateJsonKeyError,
+                    InvalidRecordError,
                     ValueError,
                 ) as exc:
                     raise IntegrityError(
                         f"Invalid JSON at line {line_number}: {exc}"
                     ) from exc
 
-                if not isinstance(envelope, dict):
+                raw_record = envelope.get("record")
+                try:
+                    record = assert_json_object(raw_record)
+                except InvalidRecordError as exc:
                     raise IntegrityError(
-                        f"Envelope at line {line_number} is not an object."
-                    )
-                record = envelope.get("record")
-                if not isinstance(record, dict):
-                    raise IntegrityError(
-                        f"Missing record object at line {line_number}."
-                    )
+                        f"Missing or invalid record object at line {line_number}."
+                    ) from exc
 
                 expected_record_hash = self._record_hash(record)
                 stored_record_hash = envelope.get("record_hash")
                 if not isinstance(stored_record_hash, str) or not hmac.compare_digest(
                     stored_record_hash, expected_record_hash
                 ):
-                    raise IntegrityError(
-                        f"Record hash mismatch at line {line_number}."
-                    )
+                    raise IntegrityError(f"Record hash mismatch at line {line_number}.")
 
-                stored_previous_hash = envelope.get("previous_hash")
-                if stored_previous_hash != previous_hash:
-                    raise IntegrityError(
-                        f"Previous hash mismatch at line {line_number}."
-                    )
+                if envelope.get("previous_hash") != previous_hash:
+                    raise IntegrityError(f"Previous hash mismatch at line {line_number}.")
 
-                expected_chain_hash = self._chain_hash(
-                    previous_hash, expected_record_hash
-                )
+                expected_chain_hash = self._chain_hash(previous_hash, expected_record_hash)
                 stored_chain_hash = envelope.get("chain_hash")
                 if not isinstance(stored_chain_hash, str) or not hmac.compare_digest(
                     stored_chain_hash, expected_chain_hash
                 ):
-                    raise IntegrityError(
-                        f"Chain hash mismatch at line {line_number}."
-                    )
+                    raise IntegrityError(f"Chain hash mismatch at line {line_number}.")
 
                 if self._hmac_secret is not None:
                     expected_signature = self._signature(expected_chain_hash)
@@ -292,51 +282,32 @@ class ChronologicalLedgerManager:
                     if (
                         not isinstance(stored_signature, str)
                         or expected_signature is None
-                        or not hmac.compare_digest(
-                            stored_signature, expected_signature
-                        )
+                        or not hmac.compare_digest(stored_signature, expected_signature)
                     ):
-                        raise IntegrityError(
-                            f"HMAC signature mismatch at line {line_number}."
-                        )
+                        raise IntegrityError(f"HMAC signature mismatch at line {line_number}.")
 
-                if record.get("schema_version") != SCHEMA_VERSION:
-                    raise IntegrityError(
-                        f"Unsupported schema version at line {line_number}."
-                    )
+                schema_version = record.get("schema_version")
+                if type(schema_version) is not int or schema_version != SCHEMA_VERSION:
+                    raise IntegrityError(f"Unsupported schema version at line {line_number}.")
 
                 kind = record.get("record_type")
                 if kind not in ("baseline", "outcome"):
-                    raise IntegrityError(
-                        f"Invalid record_type at line {line_number}."
-                    )
+                    raise IntegrityError(f"Invalid record_type at line {line_number}.")
 
                 try:
-                    record_id = self._validate_non_empty_string(
-                        record.get("record_id"), "record_id"
+                    record_id = self._required_string(record, "record_id")
+                    target_id = self._required_string(record, "target_id")
+                    timestamp = _parse_utc_timestamp(
+                        self._required_string(record, "event_timestamp")
                     )
-                    target_id = self._validate_non_empty_string(
-                        record.get("target_id"), "target_id"
-                    )
-                    version = self._validate_non_empty_string(
-                        record.get("execution_version"), "execution_version"
-                    )
-                    timestamp_text = self._validate_non_empty_string(
-                        record.get("event_timestamp"), "event_timestamp"
-                    )
-                    timestamp = _parse_utc_timestamp(timestamp_text)
+                    self._required_string(record, "execution_version")
                 except InvalidRecordError as exc:
                     raise IntegrityError(
                         f"Invalid record fields at line {line_number}: {exc}"
                     ) from exc
 
-                payload = record.get("payload")
-                if not isinstance(payload, dict):
-                    raise IntegrityError(
-                        f"Payload must be an object at line {line_number}."
-                    )
                 try:
-                    _validate_json_value(payload)
+                    payload = assert_json_object(record.get("payload"))
                 except InvalidRecordError as exc:
                     raise IntegrityError(
                         f"Invalid payload at line {line_number}: {exc}"
@@ -346,11 +317,8 @@ class ChronologicalLedgerManager:
                     raise IntegrityError(
                         f"Retroactive timestamp in existing ledger at line {line_number}."
                     )
-
                 if record_id in record_ids:
-                    raise IntegrityError(
-                        f"Duplicate record_id at line {line_number}."
-                    )
+                    raise IntegrityError(f"Duplicate record_id at line {line_number}.")
 
                 if kind == "baseline":
                     if record.get("baseline_ref") is not None:
@@ -361,8 +329,8 @@ class ChronologicalLedgerManager:
                     baseline_ref = record.get("baseline_ref")
                     if not isinstance(baseline_ref, str) or baseline_ref not in baselines:
                         raise IntegrityError(
-                            f"Orphan outcome at line {line_number}: "
-                            "baseline_ref is not a previously verified baseline."
+                            f"Orphan outcome at line {line_number}: baseline_ref "
+                            "is not a previously verified baseline."
                         )
                     if baselines[baseline_ref].get("target_id") != target_id:
                         raise IntegrityError(
@@ -385,35 +353,26 @@ class ChronologicalLedgerManager:
 
         return records, composite_index, baselines, last_timestamp, previous_hash
 
-
     @contextmanager
     def _writer_lock(self) -> Iterator[None]:
         """Acquire an advisory process lock for the complete append transaction."""
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = self.ledger_path.with_name(
-            self.ledger_path.name + ".writer.lock"
-        )
+        lock_path = self.ledger_path.with_name(self.ledger_path.name + ".writer.lock")
         with lock_path.open("a+b") as lock_stream:
             if os.name == "nt":
-                # msvcrt's Windows-only API is not fully described by all
-                # typeshed versions. Keep this platform-specific boundary Any.
-                msvcrt_module: Any = __import__("msvcrt")
-
+                imported_module = importlib.import_module("msvcrt")
+                windows_lock = cast(WindowsLockable, imported_module)
                 lock_stream.seek(0, os.SEEK_END)
                 if lock_stream.tell() == 0:
-                    lock_stream.write(b"\\0")
+                    lock_stream.write(b"\0")
                     lock_stream.flush()
                 lock_stream.seek(0)
-                msvcrt_module.locking(
-                    lock_stream.fileno(), msvcrt_module.LK_LOCK, 1
-                )
+                windows_lock.locking(lock_stream.fileno(), windows_lock.LK_LOCK, 1)
                 try:
                     yield
                 finally:
                     lock_stream.seek(0)
-                    msvcrt_module.locking(
-                        lock_stream.fileno(), msvcrt_module.LK_UNLCK, 1
-                    )
+                    windows_lock.locking(lock_stream.fileno(), windows_lock.LK_UNLCK, 1)
             else:
                 import fcntl
 
@@ -481,20 +440,20 @@ class ChronologicalLedgerManager:
         payload: JsonObject,
         baseline_ref: str | None,
     ) -> Literal["appended", "already_exists"]:
-        record_id = self._validate_non_empty_string(record_id, "record_id")
-        target_id = self._validate_non_empty_string(target_id, "target_id")
-        execution_version = self._validate_non_empty_string(
-            execution_version, "execution_version"
-        )
+        record_id = record_id.strip()
+        target_id = target_id.strip()
+        execution_version = execution_version.strip()
+        if not record_id or not target_id or not execution_version:
+            raise InvalidRecordError("record_id, target_id and execution_version are required.")
         timestamp = _parse_utc_timestamp(event_timestamp)
-        _validate_json_value(payload)
+        validated_payload = assert_json_object(payload)
 
         if record_type == "baseline" and baseline_ref is not None:
             raise InvalidRecordError("A baseline cannot reference another baseline.")
         if record_type == "outcome":
-            baseline_ref = self._validate_non_empty_string(
-                baseline_ref, "baseline_ref"
-            )
+            if baseline_ref is None or not baseline_ref.strip():
+                raise InvalidRecordError("baseline_ref must be a non-empty string.")
+            baseline_ref = baseline_ref.strip()
 
         with self._writer_lock():
             (
@@ -506,7 +465,7 @@ class ChronologicalLedgerManager:
             ) = self._load_verified()
 
             if record_type == "outcome":
-                if baseline_ref not in baselines:
+                if baseline_ref is None or baseline_ref not in baselines:
                     raise InvalidRecordError(
                         "Outcome rejected: baseline_ref does not identify a "
                         "previously verified baseline."
@@ -516,7 +475,7 @@ class ChronologicalLedgerManager:
                         "Outcome target_id must match the referenced baseline."
                     )
 
-            record: dict[str, Any] = {
+            record: JsonObject = {
                 "schema_version": SCHEMA_VERSION,
                 "record_type": record_type,
                 "record_id": record_id,
@@ -524,14 +483,14 @@ class ChronologicalLedgerManager:
                 "execution_version": execution_version,
                 "event_timestamp": event_timestamp,
                 "baseline_ref": baseline_ref,
-                "payload": payload,
+                "payload": validated_payload,
             }
             index_key = self._composite_index(record)
             existing = composite_index.get(index_key)
 
             if existing is not None:
-                existing_record = existing["record"]
-                if existing_record.get("payload") == payload:
+                existing_record = assert_json_object(existing.get("record"))
+                if existing_record.get("payload") == validated_payload:
                     LOGGER.info(
                         "Idempotent replay skipped: index=%s key=%s record_id=%s",
                         index_key[0],
@@ -544,13 +503,14 @@ class ChronologicalLedgerManager:
                     "different business payload."
                 )
 
-            existing_ids = {
-                item["record"]["record_id"] for item in existing_records
-            }
+            existing_ids: set[str] = set()
+            for item in existing_records:
+                existing_record = assert_json_object(item.get("record"))
+                existing_id = existing_record.get("record_id")
+                if isinstance(existing_id, str):
+                    existing_ids.add(existing_id)
             if record_id in existing_ids:
-                raise DuplicateConflictError(
-                    f"record_id {record_id!r} has already been used."
-                )
+                raise DuplicateConflictError(f"record_id {record_id!r} has already been used.")
 
             if last_timestamp is not None and timestamp < last_timestamp:
                 raise InvalidRecordError(
@@ -560,7 +520,7 @@ class ChronologicalLedgerManager:
 
             record_hash = self._record_hash(record)
             chain_hash = self._chain_hash(previous_hash, record_hash)
-            envelope: dict[str, Any] = {
+            envelope: JsonObject = {
                 "record": record,
                 "record_hash": record_hash,
                 "previous_hash": previous_hash,
@@ -570,7 +530,6 @@ class ChronologicalLedgerManager:
             encoded_line = _canonical_json(envelope) + b"\n"
 
             self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
-            # The advisory lock serializes cooperating writers on this host.
             with self.ledger_path.open("ab") as stream:
                 stream.write(encoded_line)
                 stream.flush()
