@@ -359,6 +359,10 @@ class ChronologicalLedgerManager:
                             f"Orphan outcome at line {line_number}: "
                             "baseline_ref is not a previously verified baseline."
                         )
+                    if baselines[baseline_ref].get("target_id") != target_id:
+                        raise IntegrityError(
+                            f"Outcome target does not match its baseline at line {line_number}."
+                        )
 
                 index_key = self._composite_index(record)
                 if index_key in composite_index:
@@ -456,11 +460,16 @@ class ChronologicalLedgerManager:
             previous_hash,
         ) = self._load_verified()
 
-        if record_type == "outcome" and baseline_ref not in baselines:
-            raise InvalidRecordError(
-                "Outcome rejected: baseline_ref does not identify a "
-                "previously verified baseline."
-            )
+        if record_type == "outcome":
+            if baseline_ref not in baselines:
+                raise InvalidRecordError(
+                    "Outcome rejected: baseline_ref does not identify a "
+                    "previously verified baseline."
+                )
+            if baselines[baseline_ref].get("target_id") != target_id:
+                raise InvalidRecordError(
+                    "Outcome target_id must match the referenced baseline."
+                )
 
         record: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
