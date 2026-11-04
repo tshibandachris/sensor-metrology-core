@@ -371,6 +371,7 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
                     process.join(timeout=5)
 
     def test_out_of_band_write_while_process_waits_for_lock_is_rejected(self) -> None:
+        self.append_baseline()
         context = multiprocessing.get_context("spawn")
         reached_lock = context.Event()
         release_lock = context.Event()
@@ -384,7 +385,7 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
                 results,
                 "baseline-out-of-band",
                 "sensor-out-of-band",
-                "2026-10-30T08:00:00Z",
+                "2026-10-30T08:01:00Z",
             ),
         )
 
@@ -394,7 +395,18 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
                 reached_lock.wait(timeout=15),
                 "Worker did not reach the pre-lock wait boundary.",
             )
-            self.ledger_path.write_bytes(b'{"out_of_band":true}\\n')
+
+            # Reformat an existing valid JSONL envelope without changing its
+            # parsed content or chain hash. The byte-level fingerprint must
+            # still detect this out-of-band write after the worker acquires
+            # the advisory lock.
+            original = self.ledger_path.read_bytes()
+            externally_modified = original.replace(
+                b'{"chain_hash"', b'{ "chain_hash"', 1
+            )
+            self.assertNotEqual(externally_modified, original)
+            self.ledger_path.write_bytes(externally_modified)
+
             release_lock.set()
             process.join(timeout=20)
             self.assertFalse(process.is_alive(), "Worker process did not exit.")
@@ -402,11 +414,13 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
             outcome = results.get(timeout=5)
             self.assertEqual(outcome[0], "error")
             self.assertEqual(outcome[1], "IntegrityError")
+            self.assertIn("drifted", outcome[2])
             self.assertEqual(
                 self.ledger_path.read_bytes(),
-                b'{"out_of_band":true}\\n',
+                externally_modified,
                 "The append must not overwrite an out-of-band modification.",
             )
+            self.assertEqual(self.ledger.verify(), 1)
         finally:
             release_lock.set()
             if process.is_alive():
