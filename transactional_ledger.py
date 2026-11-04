@@ -24,9 +24,7 @@ from chronological_ledger import (
     IntegrityError,
     InvalidRecordError,
     JsonObject,
-    JsonValue,
     _canonical_json,
-    _chain_hash,
     _parse_utc_timestamp,
     _reject_duplicate_json_keys,
     _reject_json_constant,
@@ -35,6 +33,12 @@ from chronological_ledger import (
 )
 
 AppendResult = Literal["appended", "already_exists"]
+
+
+def _chain_hash(previous_hash: str, record_hash: str) -> str:
+    return hashlib.sha256(
+        f"{previous_hash}:{record_hash}".encode("ascii")
+    ).hexdigest()
 
 
 class TransactionalLedgerManager:
@@ -77,7 +81,8 @@ class TransactionalLedgerManager:
         return connection
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        connection = self._connect()
+        try:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(
                 """
@@ -122,6 +127,8 @@ class TransactionalLedgerManager:
                 END;
                 """
             )
+        finally:
+            connection.close()
 
     @staticmethod
     def _composite_key(
@@ -343,6 +350,7 @@ class TransactionalLedgerManager:
             ).fetchall()
             previous_hash = GENESIS_HASH
             last_timestamp = None
+            last_timestamp_text: str | None = None
             record_ids: set[str] = set()
             baselines: dict[str, str] = {}
             composite_keys: set[str] = set()
@@ -397,19 +405,24 @@ class TransactionalLedgerManager:
                     raise IntegrityError(
                         f"Invalid record fields at sequence {row['sequence']}."
                     )
-                timestamp = _parse_utc_timestamp(timestamp_text)
+                try:
+                    timestamp = _parse_utc_timestamp(timestamp_text)
+                except InvalidRecordError as exc:
+                    raise IntegrityError(
+                        f"Invalid timestamp at sequence {row['sequence']}."
+                    ) from exc
                 if last_timestamp is not None and timestamp < last_timestamp:
                     raise IntegrityError(
                         f"Retroactive timestamp at sequence {row['sequence']}."
                     )
                 if record_id in record_ids:
                     raise IntegrityError(f"Duplicate record_id {record_id!r}.")
-                if record.get("payload") is None or not isinstance(
-                    record.get("payload"), dict
-                ):
+                try:
+                    assert_json_object(record.get("payload"))
+                except InvalidRecordError as exc:
                     raise IntegrityError(
                         f"Invalid payload at sequence {row['sequence']}."
-                    )
+                    ) from exc
 
                 baseline_ref = record.get("baseline_ref")
                 if record_type == "baseline":
@@ -449,6 +462,7 @@ class TransactionalLedgerManager:
                 record_ids.add(record_id)
                 previous_hash = chain_hash
                 last_timestamp = timestamp
+                last_timestamp_text = timestamp_text
 
             meta = connection.execute(
                 "SELECT head_hash, last_timestamp, record_count "
@@ -459,11 +473,7 @@ class TransactionalLedgerManager:
             if (
                 meta["head_hash"] != previous_hash
                 or meta["record_count"] != len(rows)
-                or meta["last_timestamp"] != (
-                    last_timestamp.isoformat().replace("+00:00", "Z")
-                    if last_timestamp is not None
-                    else None
-                )
+                or meta["last_timestamp"] != last_timestamp_text
             ):
                 raise IntegrityError("Ledger metadata does not match verified records.")
             if expected_head_hash is not None and not hmac.compare_digest(
