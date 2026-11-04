@@ -216,7 +216,10 @@ class RemoteTrustStub:
 
     @property
     def base_url(self) -> str:
-        host, port = self._server.server_address[:2]
+        host = self._server.server_address[0]
+        port = self._server.server_address[1]
+        if not isinstance(host, str) or type(port) is not int:
+            raise RuntimeError("Stub server address has an unexpected type.")
         return f"http://{host}:{port}"
 
     @property
@@ -233,7 +236,10 @@ class RemoteTrustStub:
     @property
     def sequence(self) -> int:
         with self._lock:
-            return int(self._head["sequence"])
+            value = self._head["sequence"]
+        if type(value) is not int:
+            raise RuntimeError("Stub head sequence is not an integer.")
+        return value
 
     @property
     def chain_hash(self) -> str:
