@@ -150,6 +150,34 @@ class RemoteTrustOutboxTests(unittest.TestCase):
         self.assertEqual(self.stub.sequence, 1)
         self.assertEqual(self.ledger.get_remote_checkpoint_state()[2], None)
 
+    def test_network_failure_leaves_checkpoint_pending(self) -> None:
+        self.append_baseline()
+        with patch.object(
+            self.bridge._opener, "open", side_effect=URLError("offline")
+        ):
+            with self.assertRaises(IOError):
+                self.synchronizer.synchronize_one()
+        pending = self.ledger.get_remote_checkpoint_state()[2]
+        self.assertIsNotNone(pending)
+        if pending is None:
+            self.fail("Expected a durable pending checkpoint.")
+        self.assertEqual(pending.attempt_count, 0)
+        self.assertEqual(self.stub.sequence, 0)
+
+    def test_outbox_tampering_is_detected_by_ledger_verification(self) -> None:
+        self.append_baseline()
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "UPDATE remote_checkpoint_outbox SET chain_hash = ? WHERE sequence = 1",
+                ("f" * 64,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(IntegrityError):
+            self.ledger.verify()
+
     def test_remote_divergence_fails_closed_and_keeps_outbox_pending(self) -> None:
         self.append_baseline()
         previous = "0" * 64
