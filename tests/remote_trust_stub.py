@@ -63,7 +63,7 @@ class RemoteTrustStub:
 
             def _target_from_path(self) -> str | None:
                 parts = [unquote(part) for part in urlsplit(self.path).path.split("/")]
-                if len(parts) < 5 or parts[1:3] != ["v1", "targets"]:
+                if len(parts) != 5 or parts[1:3] != ["v1", "targets"]:
                     return None
                 return parts[3]
 
@@ -133,7 +133,8 @@ class RemoteTrustStub:
                 chain_hash = request.get("chain_hash")
                 key = request.get("idempotency_key")
                 if (
-                    request.get("protocol_version") != 1
+                    type(request.get("protocol_version")) is not int
+                    or request.get("protocol_version") != 1
                     or request.get("target_id") != target
                     or type(sequence) is not int
                     or sequence < 1
