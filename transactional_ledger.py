@@ -14,6 +14,7 @@ import hmac
 import json
 import os
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -345,17 +346,30 @@ class TransactionalLedgerManager:
         connection = self._connect()
         try:
             connection.execute("BEGIN")
+            integrity_result = connection.execute("PRAGMA integrity_check").fetchone()
+            if integrity_result is None or integrity_result[0] != "ok":
+                raise IntegrityError("SQLite database integrity check failed.")
             rows = connection.execute(
                 "SELECT * FROM ledger_records ORDER BY sequence"
             ).fetchall()
             previous_hash = GENESIS_HASH
-            last_timestamp = None
+            last_timestamp: datetime | None = None
             last_timestamp_text: str | None = None
             record_ids: set[str] = set()
             baselines: dict[str, str] = {}
             composite_keys: set[str] = set()
 
-            for row in rows:
+            for expected_sequence, row in enumerate(rows, start=1):
+                if row["sequence"] != expected_sequence:
+                    raise IntegrityError("Ledger sequence contains a gap or reordering.")
+                if not isinstance(row["record_hash"], str) or not isinstance(
+                    row["previous_hash"], str
+                ) or not isinstance(row["chain_hash"], str) or not isinstance(
+                    row["signature"], str
+                ):
+                    raise IntegrityError(
+                        f"Invalid hash or signature column at sequence {row['sequence']}."
+                    )
                 try:
                     decoded: object = json.loads(
                         row["record_json"],
