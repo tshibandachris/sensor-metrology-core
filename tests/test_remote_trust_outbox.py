@@ -227,6 +227,42 @@ class RemoteTrustOutboxTests(unittest.TestCase):
             self.ledger.mark_remote_checkpoint_delivered(forged)
         self.assertIsNotNone(self.ledger.get_remote_checkpoint_state()[2])
 
+    def test_existing_outbox_config_schema_is_migrated(self) -> None:
+        legacy_path = Path(self.temp_dir.name) / "legacy-config.sqlite3"
+        connection = sqlite3.connect(legacy_path)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE remote_checkpoint_config (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO remote_checkpoint_config(singleton, enabled) VALUES (1, 0)"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = TransactionalLedgerManager(
+            legacy_path,
+            hmac_secret=TEST_SECRET,
+        )
+        connection = sqlite3.connect(legacy_path)
+        try:
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(remote_checkpoint_config)"
+                ).fetchall()
+            }
+        finally:
+            connection.close()
+        self.assertIn("remote_target_id", columns)
+        self.assertEqual(migrated.verify(), 0)
+
     def test_remote_outbox_is_opt_in_for_existing_ledger(self) -> None:
         disabled = TransactionalLedgerManager(
             Path(self.temp_dir.name) / "disabled.sqlite3",
