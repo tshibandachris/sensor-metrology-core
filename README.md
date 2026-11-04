@@ -22,7 +22,12 @@ sensor-metrology-core/
 ├── .github/workflows/verify-metrology.yml
 ├── data/
 ├── reports/
-├── tests/test_sensor_auditor.py
+├── tests/
+│   ├── test_sensor_auditor.py
+│   ├── test_ledger_integrity.py
+│   └── test_transactional_ledger.py
+├── chronological_ledger.py
+├── transactional_ledger.py
 ├── sensor_integrity_auditor.py
 ├── requirements.txt
 └── README.md
@@ -83,7 +88,7 @@ python -m pip install -r requirements.txt
 ## Run tests
 
 ```bash
-python -m unittest discover -s tests -p "test_sensor_auditor.py" -v
+python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 ## Run the auditor
@@ -104,7 +109,7 @@ python sensor_integrity_auditor.py \
 
 ## Continuous integration
 
-GitHub Actions runs the unit suite on an isolated Ubuntu runner with Python 3.12. It runs on pushes to `main` and `feature/hardened-io-gate`, and on pull requests targeting `main`.
+GitHub Actions runs strict Mypy gates and the complete unittest suite on Ubuntu and Windows with Python 3.12. It runs on pushes to `main` and the active hardening branches, and on pull requests targeting `main`.
 
 To make the workflow a blocking merge gate, configure branch protection or a repository ruleset for `main` and require the check named `Python 3.12 — Integrity tests`.
 
@@ -158,3 +163,13 @@ through one trusted service/API where possible. For a hostile or untrusted
 writer with raw filesystem access, use a separately administered database
 server or append-only remote trust service. Do not treat local triggers or
 HMAC alone as a substitute for access control.
+
+
+### Migration note
+
+The SQLite backend is an additional storage implementation; it does not
+automatically import an existing JSONL ledger. Keep the source JSONL file
+unchanged and verified during any migration. A dedicated, tested importer with
+an explicit preservation policy is required before moving production history.
+Do not open a JSONL ledger using the SQLite manager or point both managers at
+the same path.
