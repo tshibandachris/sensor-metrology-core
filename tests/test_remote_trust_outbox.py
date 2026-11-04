@@ -106,8 +106,9 @@ class RemoteTrustOutboxTests(unittest.TestCase):
         self.assertEqual(self.ledger.verify(), 2)
 
     def test_existing_history_is_backfilled_once_and_delivered_in_order(self) -> None:
+        history_path = Path(self.temp_dir.name) / "history.sqlite3"
         legacy = TransactionalLedgerManager(
-            self.database_path,
+            history_path,
             hmac_secret=TEST_SECRET,
         )
         legacy.append_baseline(
@@ -127,9 +128,10 @@ class RemoteTrustOutboxTests(unittest.TestCase):
         )
         self.assertEqual(legacy.enable_remote_outbox(), 2)
         self.assertEqual(legacy.enable_remote_outbox(), 0)
-        self.assertEqual(self.synchronizer.synchronize(), 2)
+        synchronizer = RemoteTrustSynchronizer(legacy, self.bridge)
+        self.assertEqual(synchronizer.synchronize(), 2)
         self.assertEqual(self.stub.sequence, 2)
-        self.assertEqual(self.ledger.verify(), 2)
+        self.assertEqual(legacy.verify(), 2)
 
     def test_lost_response_is_replayed_with_the_same_idempotency_key(self) -> None:
         self.append_baseline()
