@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -187,6 +188,44 @@ class ChronologicalLedgerManager:
         return hmac.new(
             self._hmac_secret, chain_hash.encode("ascii"), hashlib.sha256
         ).hexdigest()
+
+    def _storage_fingerprint(self) -> tuple[bool, str]:
+        """Return an existence flag and SHA-256 digest of the current ledger bytes."""
+        try:
+            contents = self.ledger_path.read_bytes()
+        except FileNotFoundError:
+            return False, GENESIS_HASH
+        return True, _sha256_hex(contents)
+
+    @staticmethod
+    def _write_checkpoint(checkpoint_path: Path, chain_hash: str) -> None:
+        """Atomically persist the latest chain hash in a detached checkpoint file."""
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{checkpoint_path.name}.",
+            suffix=".tmp",
+            dir=checkpoint_path.parent,
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write((chain_hash + "\\n").encode("ascii"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, checkpoint_path)
+            if os.name != "nt":
+                directory_descriptor = os.open(
+                    checkpoint_path.parent, os.O_RDONLY
+                )
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
+        finally:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
 
     @staticmethod
     def _required_string(record: JsonObject, field: str) -> str:
@@ -384,10 +423,25 @@ class ChronologicalLedgerManager:
                 finally:
                     fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
 
-    def verify(self) -> int:
-        """Verify a stable snapshot of every record and its chain."""
+    def verify(self, checkpoint_path: Path | None = None) -> int:
+        """Verify the ledger and, optionally, its independently stored checkpoint."""
         with self._writer_lock():
-            records, _, _, _, _ = self._load_verified()
+            records, _, _, _, final_chain_hash = self._load_verified()
+            if checkpoint_path is not None:
+                try:
+                    checkpoint = checkpoint_path.read_text(encoding="ascii").strip()
+                except (OSError, UnicodeDecodeError) as exc:
+                    raise IntegrityError(
+                        f"Unable to read detached checkpoint: {exc}"
+                    ) from exc
+                if (
+                    len(checkpoint) != 64
+                    or any(character not in "0123456789abcdef" for character in checkpoint)
+                    or not hmac.compare_digest(checkpoint, final_chain_hash)
+                ):
+                    raise IntegrityError(
+                        "Detached checkpoint does not match the verified ledger head."
+                    )
             return len(records)
 
     def append_baseline(
@@ -457,7 +511,15 @@ class ChronologicalLedgerManager:
                 raise InvalidRecordError("baseline_ref must be a non-empty string.")
             baseline_ref = baseline_ref.strip()
 
+        initial_fingerprint = self._storage_fingerprint()
+        initial_state = self._load_verified()
+        if self._storage_fingerprint() != initial_fingerprint:
+            raise IntegrityError(
+                "Ledger changed while the pre-lock state was being loaded."
+            )
+
         with self._writer_lock():
+            locked_fingerprint = self._storage_fingerprint()
             (
                 existing_records,
                 composite_index,
@@ -465,6 +527,14 @@ class ChronologicalLedgerManager:
                 last_timestamp,
                 previous_hash,
             ) = self._load_verified()
+            if (
+                self._storage_fingerprint() != locked_fingerprint
+                or locked_fingerprint != initial_fingerprint
+                or previous_hash != initial_state[4]
+            ):
+                raise IntegrityError(
+                    "Ledger state drifted between the initial read and locked append."
+                )
 
             if record_type == "outcome":
                 if baseline_ref is None or baseline_ref not in baselines:
@@ -532,9 +602,15 @@ class ChronologicalLedgerManager:
             encoded_line = _canonical_json(envelope) + b"\n"
 
             self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+            if self._storage_fingerprint() != locked_fingerprint:
+                raise IntegrityError(
+                    "Ledger changed out of band immediately before append."
+                )
             with self.ledger_path.open("ab") as stream:
                 stream.write(encoded_line)
                 stream.flush()
                 os.fsync(stream.fileno())
 
+            checkpoint_path = self.ledger_path.parent / "reports" / "ledger_checkpoint.sha256"
+            self._write_checkpoint(checkpoint_path, chain_hash)
             return "appended"
