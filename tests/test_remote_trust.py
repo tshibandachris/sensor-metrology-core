@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 from urllib.error import URLError
 
 from remote_trust_bridge import RemoteTrustBridge
-from tests.remote_trust_stub import RemoteTrustStub
+from remote_trust_stub import RemoteTrustStub
 
 
 def _chain_hash(previous_hash: str, record_hash: str) -> str:
@@ -122,16 +122,21 @@ class RemoteTrustBridgeTests(unittest.TestCase):
         record = hashlib.sha256(b"record-lost-response").hexdigest()
         chain = _chain_hash(previous, record)
         self.stub.drop_next_post_response = True
-        arguments = {
-            "sequence": 1,
-            "previous_hash": previous,
-            "record_hash": record,
-            "chain_hash": chain,
-            "idempotency_key": "append-retry-001",
-        }
         with self.assertRaises(IOError):
-            self.bridge.post_new_chain_head(**arguments)
-        receipt = self.bridge.post_new_chain_head(**arguments)
+            self.bridge.post_new_chain_head(
+                sequence=1,
+                previous_hash=previous,
+                record_hash=record,
+                chain_hash=chain,
+                idempotency_key="append-retry-001",
+            )
+        receipt = self.bridge.post_new_chain_head(
+            sequence=1,
+            previous_hash=previous,
+            record_hash=record,
+            chain_hash=chain,
+            idempotency_key="append-retry-001",
+        )
         self.assertEqual(receipt.sequence, 1)
         self.assertEqual(receipt.chain_hash, chain)
         self.assertEqual(self.stub.sequence, 1)
