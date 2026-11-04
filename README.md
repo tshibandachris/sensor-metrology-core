@@ -111,3 +111,50 @@ To make the workflow a blocking merge gate, configure branch protection or a rep
 ## License
 
 Add an explicit license before redistributing this repository.
+
+
+## Transactional chronological ledger
+
+The original `ChronologicalLedgerManager` stores JSONL and uses advisory file
+locks. Those locks coordinate only processes that voluntarily use the same
+lock protocol. A process that writes directly to the JSONL path can still race
+the final fingerprint check and append; a local checkpoint is not an
+independent trust anchor.
+
+For workloads that need concurrent cooperating writers, the repository also
+provides `TransactionalLedgerManager` in `transactional_ledger.py`. It uses
+SQLite transactions:
+
+- `BEGIN IMMEDIATE` serializes writers before they read the current chain head.
+- The record insert and metadata/head update commit in one database transaction.
+- WAL mode gives readers a consistent snapshot while writers commit.
+- A busy timeout bounds lock waiting.
+- Full synchronous mode requests durable commits.
+- Database triggers reject ordinary SQL UPDATE and DELETE operations on
+  ledger rows; full chain and HMAC verification detects unauthorized changes.
+
+Example:
+
+```python
+from pathlib import Path
+from transactional_ledger import TransactionalLedgerManager
+
+ledger = TransactionalLedgerManager(Path("data/metrology.sqlite3"))
+ledger.append_baseline(
+    record_id="baseline-001",
+    target_id="sensor-001",
+    execution_version="build-2026.11",
+    event_timestamp="2026-11-01T08:00:00Z",
+    payload={"pressure_pa": 101325},
+)
+assert ledger.verify() == 1
+```
+
+SQLite provides transaction isolation for clients that use SQLite correctly;
+it does **not** make a database file safe against an arbitrary actor with
+unrestricted filesystem access. Protect the database, WAL, and SHM files with
+OS permissions, keep the HMAC secret outside the database, and expose writes
+through one trusted service/API where possible. For a hostile or untrusted
+writer with raw filesystem access, use a separately administered database
+server or append-only remote trust service. Do not treat local triggers or
+HMAC alone as a substitute for access control.
