@@ -21,6 +21,8 @@ jobs:
     name: Python 3.12 — Integrity tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      PYTHONUTF8: "1"
 
     steps:
       - name: Checkout repository
