@@ -6,6 +6,7 @@ on:
       - main
       - feature/hardened-io-gate
       - feature/clean-hardened-io
+      - feature/sqlite-transactional-ledger
   pull_request:
     branches:
       - main
