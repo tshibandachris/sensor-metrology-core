@@ -7,6 +7,7 @@ on:
       - feature/hardened-io-gate
       - feature/clean-hardened-io
       - feature/sqlite-transactional-ledger
+      - feature/remote-trust-checkpoint
   pull_request:
     branches:
       - main
@@ -51,7 +52,7 @@ jobs:
 
       - name: Mandatory ledger and integrity-test strict typing gate
         run: |
-          mypy --strict chronological_ledger.py transactional_ledger.py tests/test_ledger_integrity.py tests/test_transactional_ledger.py
+          mypy --strict chronological_ledger.py transactional_ledger.py remote_trust_bridge.py tests/test_ledger_integrity.py tests/test_transactional_ledger.py tests/remote_trust_stub.py tests/test_remote_trust.py
 
       - name: Mandatory auditor strict typing gate
         run: |
