@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 from chronological_ledger import (
     GENESIS_HASH,
@@ -241,6 +245,73 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
                 payload={"pressure_pa": 100900},
             )
         self.assertEqual(self.ledger.verify(), 1)
+
+    def test_concurrent_append_prevention(self) -> None:
+        original_lock = self.ledger._writer_lock
+
+        @contextmanager
+        def mutate_after_lock():
+            with original_lock():
+                self.ledger_path.write_bytes(b'{"out_of_band":true}\\n')
+                yield
+
+        with patch.object(self.ledger, "_writer_lock", mutate_after_lock):
+            with self.assertRaises(IntegrityError):
+                self.ledger.append_baseline(
+                    record_id="baseline-raced",
+                    target_id="sensor-raced",
+                    execution_version="build-a1",
+                    event_timestamp="2026-10-30T08:00:00Z",
+                    payload={"pressure_pa": 101325},
+                )
+
+    def test_tamper_detection_via_detached_checkpoint(self) -> None:
+        self.append_baseline()
+        checkpoint_path = (
+            self.ledger_path.parent / "reports" / "ledger_checkpoint.sha256"
+        )
+        original_checkpoint = checkpoint_path.read_text(encoding="ascii").strip()
+        envelope = self._load_json_object(
+            self.ledger_path.read_text(encoding="utf-8").strip()
+        )
+        record = self._load_json_object(json.dumps(envelope["record"]))
+        payload = self._load_json_object(json.dumps(record["payload"]))
+        payload["pressure_pa"] = 999999
+        record["payload"] = payload
+
+        canonical_record = json.dumps(
+            record,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        record_hash = hashlib.sha256(canonical_record).hexdigest()
+        chain_hash = hashlib.sha256(
+            f"{GENESIS_HASH}:{record_hash}".encode("ascii")
+        ).hexdigest()
+        signature = hmac.new(
+            self.secret, chain_hash.encode("ascii"), hashlib.sha256
+        ).hexdigest()
+        rewritten_envelope = {
+            "record": record,
+            "record_hash": record_hash,
+            "previous_hash": GENESIS_HASH,
+            "chain_hash": chain_hash,
+            "signature": signature,
+        }
+        rewritten_line = json.dumps(
+            rewritten_envelope,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        self.ledger_path.write_text(rewritten_line + "\\n", encoding="utf-8")
+
+        self.assertNotEqual(chain_hash, original_checkpoint)
+        with self.assertRaises(IntegrityError):
+            self.ledger.verify(checkpoint_path=checkpoint_path)
 
 
 if __name__ == "__main__":
