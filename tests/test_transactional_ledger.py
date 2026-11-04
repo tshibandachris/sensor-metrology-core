@@ -171,6 +171,7 @@ class TransactionalLedgerTests(unittest.TestCase):
                 "UPDATE ledger_records SET record_json = '{}' "
                 "WHERE record_id = 'baseline-001'"
             )
+            connection.commit()
         finally:
             connection.close()
         with self.assertRaises(IntegrityError):
