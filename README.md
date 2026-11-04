@@ -245,7 +245,9 @@ When remote anchoring is enabled:
 
 The configured `REMOTE_TRUST_TARGET_ID` identifies the **whole ledger stream**,
 not an individual sensor's `target_id`: the remote sequence follows the
-global SQLite ledger sequence. Keep one stable remote target ID per ledger.
+global SQLite ledger sequence. The first synchronizer permanently binds that
+SQLite database to the remote target ID; attempting to reuse the same database
+with another remote target fails closed.
 
 The outbox provides durable delivery state, not a production remote service.
 The remote witness must still be independently operated, use atomic
