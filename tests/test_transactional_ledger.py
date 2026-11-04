@@ -7,7 +7,6 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from queue import Queue
 from typing import Any
 
 from chronological_ledger import (
