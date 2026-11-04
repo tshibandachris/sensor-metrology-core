@@ -3,12 +3,66 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import multiprocessing
 import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 from unittest.mock import patch
+
+
+
+class _PausedLedgerManager(ChronologicalLedgerManager):
+    """Pause after the pre-lock snapshot, before acquiring the OS lock."""
+
+    def __init__(
+        self,
+        ledger_path: Path,
+        reached_lock: Any,
+        release_lock: Any,
+        hmac_secret: bytes,
+    ) -> None:
+        super().__init__(ledger_path, hmac_secret=hmac_secret)
+        self._reached_lock = reached_lock
+        self._release_lock = release_lock
+
+    @contextmanager
+    def _writer_lock(self) -> Iterator[None]:
+        self._reached_lock.set()
+        if not self._release_lock.wait(timeout=15):
+            raise TimeoutError("Test did not release the simulated lock wait.")
+        with super()._writer_lock():
+            yield
+
+
+def _multiprocess_append_worker(
+    ledger_path: str,
+    reached_lock: Any,
+    release_lock: Any,
+    results: Any,
+    record_id: str,
+    target_id: str,
+    timestamp: str,
+) -> None:
+    """Run one append in an independent interpreter process."""
+    manager = _PausedLedgerManager(
+        Path(ledger_path),
+        reached_lock,
+        release_lock,
+        b"test-only-hmac-secret-material-32-bytes",
+    )
+    try:
+        result = manager.append_baseline(
+            record_id=record_id,
+            target_id=target_id,
+            execution_version="build-multiprocess",
+            event_timestamp=timestamp,
+            payload={"pressure_pa": 101325},
+        )
+        results.put(("ok", result))
+    except Exception as exc:
+        results.put(("error", type(exc).__name__, str(exc)))
 
 from chronological_ledger import (
     GENESIS_HASH,
@@ -265,6 +319,98 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
                     event_timestamp="2026-10-30T08:00:00Z",
                     payload={"pressure_pa": 101325},
                 )
+
+    def test_independent_processes_detect_stale_pre_lock_snapshot(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        release_lock = context.Event()
+        reached_locks = [context.Event(), context.Event()]
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=_multiprocess_append_worker,
+                args=(
+                    str(self.ledger_path),
+                    reached_locks[index],
+                    release_lock,
+                    results,
+                    f"baseline-process-{index}",
+                    f"sensor-process-{index}",
+                    f"2026-10-30T08:0{index}:00Z",
+                ),
+            )
+            for index in range(2)
+        ]
+
+        try:
+            for process in processes:
+                process.start()
+            for reached in reached_locks:
+                self.assertTrue(
+                    reached.wait(timeout=15),
+                    "Both processes must capture their pre-lock snapshot.",
+                )
+            release_lock.set()
+
+            for process in processes:
+                process.join(timeout=20)
+                self.assertFalse(process.is_alive(), "Worker process did not exit.")
+                self.assertEqual(process.exitcode, 0)
+
+            outcomes = [results.get(timeout=5) for _ in processes]
+            self.assertEqual(sum(item[0] == "ok" for item in outcomes), 1)
+            self.assertEqual(sum(item[0] == "error" for item in outcomes), 1)
+            error = next(item for item in outcomes if item[0] == "error")
+            self.assertEqual(error[1], "IntegrityError")
+            self.assertEqual(self.ledger.verify(), 1)
+        finally:
+            release_lock.set()
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+
+    def test_out_of_band_write_while_process_waits_for_lock_is_rejected(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        reached_lock = context.Event()
+        release_lock = context.Event()
+        results = context.Queue()
+        process = context.Process(
+            target=_multiprocess_append_worker,
+            args=(
+                str(self.ledger_path),
+                reached_lock,
+                release_lock,
+                results,
+                "baseline-out-of-band",
+                "sensor-out-of-band",
+                "2026-10-30T08:00:00Z",
+            ),
+        )
+
+        try:
+            process.start()
+            self.assertTrue(
+                reached_lock.wait(timeout=15),
+                "Worker did not reach the pre-lock wait boundary.",
+            )
+            self.ledger_path.write_bytes(b'{"out_of_band":true}\\n')
+            release_lock.set()
+            process.join(timeout=20)
+            self.assertFalse(process.is_alive(), "Worker process did not exit.")
+            self.assertEqual(process.exitcode, 0)
+            outcome = results.get(timeout=5)
+            self.assertEqual(outcome[0], "error")
+            self.assertEqual(outcome[1], "IntegrityError")
+            self.assertEqual(
+                self.ledger_path.read_bytes(),
+                b'{"out_of_band":true}\\n',
+                "The append must not overwrite an out-of-band modification.",
+            )
+        finally:
+            release_lock.set()
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
 
     def test_tamper_detection_via_detached_checkpoint(self) -> None:
         self.append_baseline()
