@@ -44,6 +44,7 @@ class RemoteTrustStub:
         self._idempotency: dict[str, tuple[bytes, dict[str, str]]] = {}
         self._lock = threading.Lock()
         self.drop_next_post_response = False
+        self.malformed_next_get_response = False
         fixture = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -96,6 +97,17 @@ class RemoteTrustStub:
                     "checkpoint_id": head["checkpoint_id"],
                     "issued_at": "2026-11-04T12:00:00Z",
                 }
+                with fixture._lock:
+                    malformed = fixture.malformed_next_get_response
+                    fixture.malformed_next_get_response = False
+                if malformed:
+                    body = b"{malformed-json"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 self._send(200, self._signed(payload))
 
             def do_POST(self) -> None:
