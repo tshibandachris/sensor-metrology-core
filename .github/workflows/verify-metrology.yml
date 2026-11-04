@@ -50,7 +50,7 @@ jobs:
 
       - name: Mandatory ledger and integrity-test strict typing gate
         run: |
-          mypy --strict chronological_ledger.py tests/test_ledger_integrity.py
+          mypy --strict chronological_ledger.py transactional_ledger.py tests/test_ledger_integrity.py tests/test_transactional_ledger.py
 
       - name: Mandatory auditor strict typing gate
         run: |
