@@ -154,7 +154,7 @@ class RemoteTrustBridge:
             raise ValueError("At least one pinned Ed25519 public key is required.")
         self._public_keys: dict[str, Ed25519PublicKey] = {}
         for key_id, raw_key in trusted_public_keys.items():
-            if not key_id or len(key_id) > 128 or len(raw_key) != 32:
+            if not key_id or len(key_id) > 128 or not isinstance(raw_key, bytes) or len(raw_key) != 32:
                 raise ValueError("Each trusted key needs a key_id and 32 raw bytes.")
             self._public_keys[key_id] = Ed25519PublicKey.from_public_bytes(raw_key)
 
