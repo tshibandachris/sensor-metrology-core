@@ -86,6 +86,13 @@ def _validate_digest(value: object, field: str) -> str:
         raise RuntimeError(f"{field} must be a lowercase SHA-256 digest.")
     return value
 
+def _validate_local_digest(value: object, field: str) -> str:
+    """Validate caller-supplied digests using the public input-error type."""
+    try:
+        return _validate_digest(value, field)
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+
 
 class RemoteTrustBridge:
     """Communicate with a remote witness and verify every signed response.
@@ -289,9 +296,9 @@ class RemoteTrustBridge:
         """
         if type(sequence) is not int or sequence < 1:
             raise ValueError("sequence must be a positive integer.")
-        previous = _validate_digest(previous_hash, "previous_hash")
-        record = _validate_digest(record_hash, "record_hash")
-        supplied_chain = _validate_digest(chain_hash, "chain_hash")
+        previous = _validate_local_digest(previous_hash, "previous_hash")
+        record = _validate_local_digest(record_hash, "record_hash")
+        supplied_chain = _validate_local_digest(chain_hash, "chain_hash")
         expected_chain = hashlib.sha256(
             f"{previous}:{record}".encode("ascii")
         ).hexdigest()
