@@ -1,0 +1,506 @@
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import multiprocessing
+import tempfile
+import unittest
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+from unittest.mock import patch
+
+
+
+from chronological_ledger import (
+    GENESIS_HASH,
+    ChronologicalLedgerManager,
+    DuplicateConflictError,
+    IntegrityError,
+    InvalidRecordError,
+)
+
+class _PausedLedgerManager(ChronologicalLedgerManager):
+    """Pause after the pre-lock snapshot, before acquiring the OS lock."""
+
+    def __init__(
+        self,
+        ledger_path: Path,
+        reached_lock: Any,
+        release_lock: Any,
+        hmac_secret: bytes,
+    ) -> None:
+        super().__init__(ledger_path, hmac_secret=hmac_secret)
+        self._reached_lock = reached_lock
+        self._release_lock = release_lock
+
+    @contextmanager
+    def _writer_lock(self) -> Iterator[None]:
+        self._reached_lock.set()
+        if not self._release_lock.wait(timeout=15):
+            raise TimeoutError("Test did not release the simulated lock wait.")
+        with super()._writer_lock():
+            yield
+
+
+def _multiprocess_append_worker(
+    ledger_path: str,
+    reached_lock: Any,
+    release_lock: Any,
+    results: Any,
+    record_id: str,
+    target_id: str,
+    timestamp: str,
+) -> None:
+    """Run one append in an independent interpreter process."""
+    manager = _PausedLedgerManager(
+        Path(ledger_path),
+        reached_lock,
+        release_lock,
+        b"test-only-hmac-secret-material-32-bytes",
+    )
+    try:
+        result = manager.append_baseline(
+            record_id=record_id,
+            target_id=target_id,
+            execution_version="build-multiprocess",
+            event_timestamp=timestamp,
+            payload={"pressure_pa": 101325},
+        )
+        results.put(("ok", result))
+    except Exception as exc:
+        results.put(("error", type(exc).__name__, str(exc)))
+
+
+
+class ChronologicalLedgerIntegrityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.ledger_path = Path(self.temporary_directory.name) / "ledger.jsonl"
+        self.secret = b"test-only-hmac-secret-material-32-bytes"
+        self.ledger = ChronologicalLedgerManager(
+            self.ledger_path,
+            hmac_secret=self.secret,
+        )
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def append_baseline(self) -> str:
+        return self.ledger.append_baseline(
+            record_id="baseline-001",
+            target_id="sensor-001",
+            execution_version="build-a1",
+            event_timestamp="2026-10-30T08:00:00Z",
+            payload={"pressure_pa": 101325, "calibration": "initial"},
+        )
+
+    @staticmethod
+    def _load_json_object(line: str) -> dict[str, object]:
+        value: object = json.loads(line)
+        if not isinstance(value, dict):
+            raise AssertionError("Expected a JSON object.")
+        result: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise AssertionError("Expected string JSON keys.")
+            result[key] = item
+        return result
+
+    def test_baseline_to_outcome_sequential_chain(self) -> None:
+        self.assertEqual(self.append_baseline(), "appended")
+        result = self.ledger.append_outcome(
+            record_id="outcome-001",
+            target_id="sensor-001",
+            execution_version="build-a1",
+            event_timestamp="2026-10-30T08:05:00Z",
+            baseline_ref="baseline-001",
+            payload={"pressure_pa": 101410, "status": "measured"},
+        )
+        self.assertEqual(result, "appended")
+        self.assertEqual(self.ledger.verify(), 2)
+
+        lines = self.ledger_path.read_text(encoding="utf-8").splitlines()
+        first = self._load_json_object(lines[0])
+        second = self._load_json_object(lines[1])
+
+        self.assertEqual(first["previous_hash"], GENESIS_HASH)
+        self.assertEqual(second["previous_hash"], first["chain_hash"])
+        self.assertNotEqual(first["chain_hash"], second["chain_hash"])
+        self.assertIsNotNone(first["signature"])
+        self.assertIsNotNone(second["signature"])
+
+        first_record = self._load_json_object(json.dumps(first["record"]))
+        second_record = self._load_json_object(json.dumps(second["record"]))
+        self.assertEqual(first_record["record_type"], "baseline")
+        self.assertEqual(second_record["record_type"], "outcome")
+        self.assertEqual(second_record["baseline_ref"], first_record["record_id"])
+        self.assertEqual(
+            first_record["payload"],
+            {"pressure_pa": 101325, "calibration": "initial"},
+        )
+
+    def test_retroactive_timestamp_is_rejected(self) -> None:
+        self.append_baseline()
+        with self.assertRaises(InvalidRecordError):
+            self.ledger.append_baseline(
+                record_id="baseline-old",
+                target_id="sensor-002",
+                execution_version="build-a1",
+                event_timestamp="2026-10-30T07:59:59Z",
+                payload={"pressure_pa": 100000},
+            )
+        self.assertEqual(self.ledger.verify(), 1)
+
+    def test_composite_key_with_mutated_payload_conflicts(self) -> None:
+        self.append_baseline()
+        with self.assertRaises(DuplicateConflictError):
+            self.ledger.append_baseline(
+                record_id="baseline-replayed-differently",
+                target_id="sensor-001",
+                execution_version="build-a1",
+                event_timestamp="2026-10-30T08:00:00Z",
+                payload={"pressure_pa": 99999, "calibration": "changed"},
+            )
+        self.assertEqual(self.ledger.verify(), 1)
+
+    def test_outcome_composite_key_conflicts_on_payload_change(self) -> None:
+        self.append_baseline()
+        self.ledger.append_outcome(
+            record_id="outcome-001",
+            target_id="sensor-001",
+            execution_version="build-a1",
+            event_timestamp="2026-10-30T08:05:00Z",
+            baseline_ref="baseline-001",
+            payload={"pressure_pa": 101410},
+        )
+        with self.assertRaises(DuplicateConflictError):
+            self.ledger.append_outcome(
+                record_id="outcome-replay",
+                target_id="sensor-001",
+                execution_version="build-a1",
+                event_timestamp="2026-10-30T08:05:00Z",
+                baseline_ref="baseline-001",
+                payload={"pressure_pa": 101411},
+            )
+        self.assertEqual(self.ledger.verify(), 2)
+
+    def test_exact_idempotent_replay_is_skipped_with_trace(self) -> None:
+        self.assertEqual(self.append_baseline(), "appended")
+        with self.assertLogs("chronological_ledger", level="INFO") as captured:
+            self.assertEqual(self.append_baseline(), "already_exists")
+        self.assertTrue(
+            any("Idempotent replay skipped" in message for message in captured.output)
+        )
+        self.assertEqual(self.ledger.verify(), 1)
+        self.assertEqual(len(self.ledger_path.read_text().splitlines()), 1)
+
+    def test_outcome_target_must_match_baseline(self) -> None:
+        self.append_baseline()
+        with self.assertRaises(InvalidRecordError):
+            self.ledger.append_outcome(
+                record_id="outcome-wrong-target",
+                target_id="sensor-OTHER",
+                execution_version="build-a1",
+                event_timestamp="2026-10-30T08:05:00Z",
+                baseline_ref="baseline-001",
+                payload={"pressure_pa": 101400},
+            )
+        self.assertEqual(self.ledger.verify(), 1)
+
+    def test_orphan_outcome_is_rejected(self) -> None:
+        with self.assertRaises(InvalidRecordError):
+            self.ledger.append_outcome(
+                record_id="outcome-orphan",
+                target_id="sensor-001",
+                execution_version="build-a1",
+                event_timestamp="2026-10-30T08:05:00Z",
+                baseline_ref="missing-baseline",
+                payload={"pressure_pa": 101400},
+            )
+        self.assertFalse(self.ledger_path.exists())
+
+    def test_historical_payload_tampering_is_detected(self) -> None:
+        self.append_baseline()
+        original = self.ledger_path.read_text(encoding="utf-8")
+        tampered = original.replace("101325", "101326")
+        self.ledger_path.write_text(tampered, encoding="utf-8")
+        with self.assertRaises(IntegrityError):
+            self.ledger.verify()
+
+    def test_wrong_hmac_secret_is_rejected(self) -> None:
+        self.append_baseline()
+        wrong_key_ledger = ChronologicalLedgerManager(
+            self.ledger_path,
+            hmac_secret=b"different-test-secret-material-32-bytes",
+        )
+        with self.assertRaises(IntegrityError):
+            wrong_key_ledger.verify()
+
+    def test_deeply_nested_duplicate_json_keys_are_rejected(self) -> None:
+        malformed_line = (
+            b'{"record":{"payload":{"outer":{"middle":{"inner":'
+            b'{"measurement":1,"measurement":2}}}}}}\n'
+        )
+        self.ledger_path.write_bytes(malformed_line)
+        with self.assertRaises(IntegrityError):
+            self.ledger.verify()
+
+
+    def test_reordering_records_is_detected(self) -> None:
+        self.append_baseline()
+        self.ledger.append_baseline(
+            record_id="baseline-002",
+            target_id="sensor-002",
+            execution_version="build-a1",
+            event_timestamp="2026-10-30T08:01:00Z",
+            payload={"pressure_pa": 100900},
+        )
+        lines = self.ledger_path.read_bytes().splitlines(keepends=True)
+        self.ledger_path.write_bytes(lines[1] + lines[0])
+        with self.assertRaises(IntegrityError):
+            self.ledger.verify()
+
+    def test_removing_an_interior_record_is_detected(self) -> None:
+        self.append_baseline()
+        self.ledger.append_baseline(
+            record_id="baseline-002",
+            target_id="sensor-002",
+            execution_version="build-a1",
+            event_timestamp="2026-10-30T08:01:00Z",
+            payload={"pressure_pa": 100900},
+        )
+        self.ledger.append_baseline(
+            record_id="baseline-003",
+            target_id="sensor-003",
+            execution_version="build-a1",
+            event_timestamp="2026-10-30T08:02:00Z",
+            payload={"pressure_pa": 100800},
+        )
+        lines = self.ledger_path.read_bytes().splitlines(keepends=True)
+        self.ledger_path.write_bytes(lines[0] + lines[2])
+        with self.assertRaises(IntegrityError):
+            self.ledger.verify()
+
+    def test_incomplete_final_jsonl_line_is_rejected(self) -> None:
+        self.append_baseline()
+        with self.ledger_path.open("ab") as stream:
+            stream.write(b'{"record":')
+        with self.assertRaises(IntegrityError):
+            self.ledger.verify()
+
+    def test_record_id_cannot_be_reused_for_another_composite_key(self) -> None:
+        self.append_baseline()
+        with self.assertRaises(DuplicateConflictError):
+            self.ledger.append_baseline(
+                record_id="baseline-001",
+                target_id="sensor-002",
+                execution_version="build-a1",
+                event_timestamp="2026-10-30T08:01:00Z",
+                payload={"pressure_pa": 100900},
+            )
+        self.assertEqual(self.ledger.verify(), 1)
+
+    def test_concurrent_append_prevention(self) -> None:
+        original_lock = self.ledger._writer_lock
+
+        @contextmanager
+        def mutate_after_lock() -> Iterator[None]:
+            with original_lock():
+                self.ledger_path.write_bytes(b'{"out_of_band":true}\n')
+                yield
+
+        with patch.object(self.ledger, "_writer_lock", mutate_after_lock):
+            with self.assertRaises(IntegrityError):
+                self.ledger.append_baseline(
+                    record_id="baseline-raced",
+                    target_id="sensor-raced",
+                    execution_version="build-a1",
+                    event_timestamp="2026-10-30T08:00:00Z",
+                    payload={"pressure_pa": 101325},
+                )
+
+    def test_independent_processes_detect_stale_pre_lock_snapshot(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        release_lock = context.Event()
+        reached_locks = [context.Event(), context.Event()]
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=_multiprocess_append_worker,
+                args=(
+                    str(self.ledger_path),
+                    reached_locks[index],
+                    release_lock,
+                    results,
+                    f"baseline-process-{index}",
+                    f"sensor-process-{index}",
+                    f"2026-10-30T08:0{index}:00Z",
+                ),
+            )
+            for index in range(2)
+        ]
+
+        try:
+            for process in processes:
+                process.start()
+            for reached in reached_locks:
+                self.assertTrue(
+                    reached.wait(timeout=15),
+                    "Both processes must capture their pre-lock snapshot.",
+                )
+            release_lock.set()
+
+            for process in processes:
+                process.join(timeout=20)
+                self.assertFalse(process.is_alive(), "Worker process did not exit.")
+                self.assertEqual(process.exitcode, 0)
+
+            outcomes = [results.get(timeout=5) for _ in processes]
+            self.assertEqual(sum(item[0] == "ok" for item in outcomes), 1)
+            self.assertEqual(sum(item[0] == "error" for item in outcomes), 1)
+            error = next(item for item in outcomes if item[0] == "error")
+            self.assertEqual(error[1], "IntegrityError")
+            self.assertEqual(self.ledger.verify(), 1)
+        finally:
+            release_lock.set()
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+
+    def test_out_of_band_write_while_process_waits_for_lock_is_rejected(self) -> None:
+        self.append_baseline()
+        context = multiprocessing.get_context("spawn")
+        reached_lock = context.Event()
+        release_lock = context.Event()
+        results = context.Queue()
+        process = context.Process(
+            target=_multiprocess_append_worker,
+            args=(
+                str(self.ledger_path),
+                reached_lock,
+                release_lock,
+                results,
+                "baseline-out-of-band",
+                "sensor-out-of-band",
+                "2026-10-30T08:01:00Z",
+            ),
+        )
+
+        try:
+            process.start()
+            self.assertTrue(
+                reached_lock.wait(timeout=15),
+                "Worker did not reach the pre-lock wait boundary.",
+            )
+
+            # Reformat an existing valid JSONL envelope without changing its
+            # parsed content or chain hash. The byte-level fingerprint must
+            # still detect this out-of-band write after the worker acquires
+            # the advisory lock.
+            original = self.ledger_path.read_bytes()
+            externally_modified = original.replace(
+                b'{"chain_hash"', b'{ "chain_hash"', 1
+            )
+            self.assertNotEqual(externally_modified, original)
+            self.ledger_path.write_bytes(externally_modified)
+
+            release_lock.set()
+            process.join(timeout=20)
+            self.assertFalse(process.is_alive(), "Worker process did not exit.")
+            self.assertEqual(process.exitcode, 0)
+            outcome = results.get(timeout=5)
+            self.assertEqual(outcome[0], "error")
+            self.assertEqual(outcome[1], "IntegrityError")
+            self.assertIn("drifted", outcome[2])
+            self.assertEqual(
+                self.ledger_path.read_bytes(),
+                externally_modified,
+                "The append must not overwrite an out-of-band modification.",
+            )
+            self.assertEqual(self.ledger.verify(), 1)
+        finally:
+            release_lock.set()
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    def test_tamper_detection_via_detached_checkpoint(self) -> None:
+        self.append_baseline()
+        checkpoint_path = (
+            self.ledger_path.parent / "reports" / "ledger_checkpoint.sha256"
+        )
+        original_checkpoint = checkpoint_path.read_text(encoding="ascii").strip()
+        envelope = self._load_json_object(
+            self.ledger_path.read_text(encoding="utf-8").strip()
+        )
+        record = self._load_json_object(json.dumps(envelope["record"]))
+        payload = self._load_json_object(json.dumps(record["payload"]))
+        payload["pressure_pa"] = 999999
+        record["payload"] = payload
+
+        canonical_record = json.dumps(
+            record,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        record_hash = hashlib.sha256(canonical_record).hexdigest()
+        chain_hash = hashlib.sha256(
+            f"{GENESIS_HASH}:{record_hash}".encode("ascii")
+        ).hexdigest()
+        signature = hmac.new(
+            self.secret, chain_hash.encode("ascii"), hashlib.sha256
+        ).hexdigest()
+        rewritten_envelope = {
+            "record": record,
+            "record_hash": record_hash,
+            "previous_hash": GENESIS_HASH,
+            "chain_hash": chain_hash,
+            "signature": signature,
+        }
+        rewritten_line = json.dumps(
+            rewritten_envelope,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        self.ledger_path.write_text(rewritten_line + "\n", encoding="utf-8")
+
+        self.assertNotEqual(chain_hash, original_checkpoint)
+
+        # Simulate an actor with write access to the complete local workspace:
+        # rewrite both the ledger and its colocated checkpoint to agree with
+        # the forged chain. The remote expected head remains unchanged.
+        checkpoint_path.write_text(chain_hash + "\n", encoding="ascii")
+        self.assertEqual(
+            checkpoint_path.read_text(encoding="ascii").strip(),
+            chain_hash,
+        )
+        with self.assertRaises(IntegrityError):
+            self.ledger.verify(expected_head_hash=original_checkpoint)
+
+    def test_verification_via_explicit_head_hash(self) -> None:
+        self.append_baseline()
+        envelope = self._load_json_object(
+            self.ledger_path.read_text(encoding="utf-8").strip()
+        )
+        expected_head = envelope.get("chain_hash")
+        if not isinstance(expected_head, str):
+            raise AssertionError(
+                "Expected a string chain hash in the ledger envelope."
+            )
+        self.assertEqual(
+            self.ledger.verify(expected_head_hash=expected_head),
+            1,
+        )
+        with self.assertRaises(IntegrityError):
+            self.ledger.verify(expected_head_hash=GENESIS_HASH)
+
+
+if __name__ == "__main__":
+    unittest.main()

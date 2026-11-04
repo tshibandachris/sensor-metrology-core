@@ -8,6 +8,7 @@ htmlcov/
 data/*.jsonl
 reports/*.json
 *.tmp
+*.writer.lock
 
 .DS_Store
 Thumbs.db
