@@ -26,6 +26,7 @@ class RemoteTrustSynchronizer:
     ) -> None:
         self.ledger = ledger
         self.bridge = bridge
+        self.ledger.bind_remote_target(bridge.target_id)
 
     def _synchronize_one(self) -> SyncResult:
         """Deliver or reconcile the earliest pending checkpoint.
@@ -81,9 +82,7 @@ class RemoteTrustSynchronizer:
                 )
                 raise
 
-            self.ledger.mark_remote_checkpoint_delivered(
-                receipt.sequence, receipt.checkpoint_id
-            )
+            self.ledger.mark_remote_checkpoint_delivered(receipt)
             return result
 
         raise RuntimeError(
