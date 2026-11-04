@@ -12,7 +12,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Mapping
+from typing import Any, Mapping
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -23,18 +23,22 @@ _MAX_RESPONSE = 65_536
 _MAX_REQUEST = 8_192
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Prevent authenticated requests from being forwarded to another host."""
 
     def redirect_request(
         self,
         req: urllib.request.Request,
-        fp: object,
+        fp: Any,
         code: int,
         msg: str,
-        headers: object,
+        headers: Any,
         newurl: str,
-    ) -> None:
+    ) -> urllib.request.Request | None:
         return None
 
 
@@ -185,9 +189,7 @@ class RemoteTrustBridge:
             decoded: object = json.loads(
                 raw.decode("utf-8"),
                 object_pairs_hook=_reject_duplicate_keys,
-                parse_constant=lambda value: (_ for _ in ()).throw(
-                    ValueError(f"Invalid JSON constant: {value}")
-                ),
+                parse_constant=_reject_json_constant,
             )
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise RuntimeError("Remote trust service returned malformed JSON.") from exc
@@ -213,9 +215,7 @@ class RemoteTrustBridge:
             payload: object = json.loads(
                 payload_bytes.decode("utf-8"),
                 object_pairs_hook=_reject_duplicate_keys,
-                parse_constant=lambda value: (_ for _ in ()).throw(
-                    ValueError(f"Invalid JSON constant: {value}")
-                ),
+                parse_constant=_reject_json_constant,
             )
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise RuntimeError("Signed checkpoint payload is malformed.") from exc
@@ -240,6 +240,8 @@ class RemoteTrustBridge:
         if type(sequence) is not int or sequence < 0 or (receipt and sequence == 0):
             raise RuntimeError("Remote checkpoint sequence is invalid.")
         chain_hash = _validate_digest(payload.get("chain_hash"), "chain_hash")
+        if sequence == 0 and chain_hash != "0" * 64:
+            raise RuntimeError("Genesis checkpoint must use the all-zero chain hash.")
         if not isinstance(checkpoint_id, str) or not checkpoint_id or len(checkpoint_id) > 256:
             raise RuntimeError("checkpoint_id is invalid.")
         if not isinstance(issued_at, str) or not issued_at.endswith("Z"):
