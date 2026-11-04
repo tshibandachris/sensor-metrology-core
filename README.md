@@ -25,10 +25,14 @@ sensor-metrology-core/
 ├── tests/
 │   ├── test_sensor_auditor.py
 │   ├── test_ledger_integrity.py
-│   └── test_transactional_ledger.py
+│   ├── test_transactional_ledger.py
+│   ├── remote_trust_stub.py
+│   ├── test_remote_trust.py
+│   └── test_remote_trust_outbox.py
 ├── chronological_ledger.py
 ├── transactional_ledger.py
 ├── remote_trust_bridge.py
+├── remote_trust_outbox.py
 ├── sensor_integrity_auditor.py
 ├── requirements.txt
 └── README.md
