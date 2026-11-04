@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - feature/hardened-io-gate
+      - feature/clean-hardened-io
   pull_request:
     branches:
       - main
