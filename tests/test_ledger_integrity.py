@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 from unittest.mock import patch
 
 from chronological_ledger import (
@@ -250,7 +251,7 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
         original_lock = self.ledger._writer_lock
 
         @contextmanager
-        def mutate_after_lock():
+        def mutate_after_lock() -> Iterator[None]:
             with original_lock():
                 self.ledger_path.write_bytes(b'{"out_of_band":true}\n')
                 yield
@@ -310,8 +311,31 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
         self.ledger_path.write_text(rewritten_line + "\n", encoding="utf-8")
 
         self.assertNotEqual(chain_hash, original_checkpoint)
+
+        # Simulate an actor with write access to the complete local workspace:
+        # rewrite both the ledger and its colocated checkpoint to agree with
+        # the forged chain. The remote expected head remains unchanged.
+        checkpoint_path.write_text(chain_hash + "\n", encoding="ascii")
+        self.assertEqual(
+            checkpoint_path.read_text(encoding="ascii").strip(),
+            chain_hash,
+        )
         with self.assertRaises(IntegrityError):
-            self.ledger.verify(checkpoint_path=checkpoint_path)
+            self.ledger.verify(expected_head_hash=original_checkpoint)
+
+    def test_verification_via_explicit_head_hash(self) -> None:
+        self.append_baseline()
+        envelope = self._load_json_object(
+            self.ledger_path.read_text(encoding="utf-8").strip()
+        )
+        expected_head = envelope.get("chain_hash")
+        self.assertIsInstance(expected_head, str)
+        self.assertEqual(
+            self.ledger.verify(expected_head_hash=expected_head),
+            1,
+        )
+        with self.assertRaises(IntegrityError):
+            self.ledger.verify(expected_head_hash=GENESIS_HASH)
 
 
 if __name__ == "__main__":
