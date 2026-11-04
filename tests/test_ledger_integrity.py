@@ -252,7 +252,7 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
         @contextmanager
         def mutate_after_lock():
             with original_lock():
-                self.ledger_path.write_bytes(b'{"out_of_band":true}\\n')
+                self.ledger_path.write_bytes(b'{"out_of_band":true}\n')
                 yield
 
         with patch.object(self.ledger, "_writer_lock", mutate_after_lock):
@@ -307,7 +307,7 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
             ensure_ascii=False,
             allow_nan=False,
         )
-        self.ledger_path.write_text(rewritten_line + "\\n", encoding="utf-8")
+        self.ledger_path.write_text(rewritten_line + "\n", encoding="utf-8")
 
         self.assertNotEqual(chain_hash, original_checkpoint)
         with self.assertRaises(IntegrityError):
