@@ -154,7 +154,16 @@ remote commit but before the client receives or stores the receipt.
 
 ## Scope of this repository change
 
-This document defines the protocol contract. The next implementation step is
-a standard-library HTTP mock server plus protocol tests, followed by the
-Ed25519-verifying client. The production remote service is external and is
-not implemented by this repository.
+This repository includes the protocol document, a loopback-only test fixture,
+an Ed25519-verifying client, and an opt-in SQLite transactional outbox with
+reconciliation. The outbox persists the exact checkpoint request and
+idempotency key in the same local transaction as each ledger append, blocks
+later appends while a checkpoint is pending, and marks delivery only after a
+verified signed receipt.
+
+The production remote service remains external and is not implemented by this
+repository. The local outbox cannot provide remote availability or protect
+against an administrator who can directly rewrite the SQLite database and its
+files. Production use still requires an independently operated witness with
+atomic compare-and-swap, protected signing keys, target-scoped credentials,
+monitoring, backups, and a documented recovery procedure.
