@@ -13,6 +13,14 @@ from unittest.mock import patch
 
 
 
+from chronological_ledger import (
+    GENESIS_HASH,
+    ChronologicalLedgerManager,
+    DuplicateConflictError,
+    IntegrityError,
+    InvalidRecordError,
+)
+
 class _PausedLedgerManager(ChronologicalLedgerManager):
     """Pause after the pre-lock snapshot, before acquiring the OS lock."""
 
@@ -64,13 +72,6 @@ def _multiprocess_append_worker(
     except Exception as exc:
         results.put(("error", type(exc).__name__, str(exc)))
 
-from chronological_ledger import (
-    GENESIS_HASH,
-    ChronologicalLedgerManager,
-    DuplicateConflictError,
-    IntegrityError,
-    InvalidRecordError,
-)
 
 
 class ChronologicalLedgerIntegrityTests(unittest.TestCase):
