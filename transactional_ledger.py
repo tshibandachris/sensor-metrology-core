@@ -290,7 +290,9 @@ class TransactionalLedgerManager:
             remote_enabled_row = connection.execute(
                 "SELECT enabled FROM remote_checkpoint_config WHERE singleton = 1"
             ).fetchone()
-            remote_enabled = remote_enabled_row is not None and remote_enabled_row["enabled"] == 1
+            if remote_enabled_row is None or remote_enabled_row["enabled"] not in (0, 1):
+                raise IntegrityError("Remote checkpoint configuration row is missing or invalid.")
+            remote_enabled = remote_enabled_row["enabled"] == 1
             if remote_enabled:
                 pending = connection.execute(
                     "SELECT sequence FROM remote_checkpoint_outbox "
@@ -729,6 +731,67 @@ class TransactionalLedgerManager:
                 expected_head_hash, previous_hash
             ):
                 raise IntegrityError("Ledger head differs from external expected hash.")
+
+            remote_config = connection.execute(
+                "SELECT enabled FROM remote_checkpoint_config WHERE singleton = 1"
+            ).fetchone()
+            if remote_config is None or remote_config["enabled"] not in (0, 1):
+                raise IntegrityError("Remote checkpoint configuration row is missing or invalid.")
+            outbox_rows = connection.execute(
+                """
+                SELECT r.sequence, r.previous_hash AS ledger_previous_hash,
+                       r.record_hash AS ledger_record_hash,
+                       r.chain_hash AS ledger_chain_hash,
+                       o.sequence AS outbox_sequence,
+                       o.previous_hash, o.record_hash, o.chain_hash,
+                       o.idempotency_key, o.status, o.attempt_count,
+                       o.checkpoint_id, o.delivered_at
+                FROM ledger_records AS r
+                LEFT JOIN remote_checkpoint_outbox AS o ON o.sequence = r.sequence
+                ORDER BY r.sequence
+                """
+            ).fetchall()
+            if remote_config["enabled"] == 0 and any(
+                row["outbox_sequence"] is not None for row in outbox_rows
+            ):
+                raise IntegrityError("Disabled remote outbox contains checkpoint rows.")
+            if remote_config["enabled"] == 1 and len(outbox_rows) != len(rows):
+                raise IntegrityError("Remote outbox does not cover the complete ledger.")
+            pending_seen = False
+            for expected_sequence, outbox_row in enumerate(outbox_rows, start=1):
+                if remote_config["enabled"] == 0:
+                    break
+                if (
+                    outbox_row["outbox_sequence"] != expected_sequence
+                    or outbox_row["previous_hash"] != outbox_row["ledger_previous_hash"]
+                    or outbox_row["record_hash"] != outbox_row["ledger_record_hash"]
+                    or outbox_row["chain_hash"] != outbox_row["ledger_chain_hash"]
+                    or not isinstance(outbox_row["idempotency_key"], str)
+                    or not outbox_row["idempotency_key"]
+                    or type(outbox_row["attempt_count"]) is not int
+                    or outbox_row["attempt_count"] < 0
+                ):
+                    raise IntegrityError(
+                        f"Remote outbox entry is inconsistent at sequence {expected_sequence}."
+                    )
+                if outbox_row["status"] == "pending":
+                    pending_seen = True
+                    if (
+                        outbox_row["checkpoint_id"] is not None
+                        or outbox_row["delivered_at"] is not None
+                    ):
+                        raise IntegrityError("Pending remote checkpoint has delivery metadata.")
+                elif outbox_row["status"] == "delivered":
+                    if pending_seen:
+                        raise IntegrityError("Remote outbox delivery order contains a gap.")
+                    if (
+                        not isinstance(outbox_row["checkpoint_id"], str)
+                        or not outbox_row["checkpoint_id"]
+                        or not isinstance(outbox_row["delivered_at"], str)
+                    ):
+                        raise IntegrityError("Delivered remote checkpoint lacks receipt metadata.")
+                else:
+                    raise IntegrityError("Remote outbox contains an unknown status.")
 
             connection.execute("COMMIT")
             return len(rows)
