@@ -330,7 +330,9 @@ class ChronologicalLedgerIntegrityTests(unittest.TestCase):
         )
         expected_head = envelope.get("chain_hash")
         if not isinstance(expected_head, str):
-            self.fail("Expected a string chain hash in the ledger envelope.")
+            raise AssertionError(
+                "Expected a string chain hash in the ledger envelope."
+            )
         self.assertEqual(
             self.ledger.verify(expected_head_hash=expected_head),
             1,
