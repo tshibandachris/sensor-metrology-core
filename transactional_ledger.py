@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
+from remote_trust_bridge import VerifiedChainHead
 from chronological_ledger import (
     GENESIS_HASH,
     SCHEMA_VERSION,
@@ -148,7 +149,8 @@ class TransactionalLedgerManager:
 
                 CREATE TABLE IF NOT EXISTS remote_checkpoint_config (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))
+                    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                    remote_target_id TEXT
                 );
 
                 INSERT OR IGNORE INTO remote_checkpoint_config (singleton, enabled)
@@ -172,6 +174,16 @@ class TransactionalLedgerManager:
                 ON remote_checkpoint_outbox(status, sequence);
                 """
             )
+            config_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(remote_checkpoint_config)"
+                ).fetchall()
+            }
+            if "remote_target_id" not in config_columns:
+                connection.execute(
+                    "ALTER TABLE remote_checkpoint_config ADD COLUMN remote_target_id TEXT"
+                )
         finally:
             connection.close()
 
@@ -459,6 +471,43 @@ class TransactionalLedgerManager:
         finally:
             connection.close()
 
+    def bind_remote_target(self, remote_target_id: str) -> None:
+        """Permanently bind this ledger's remote stream to one witness target."""
+        if (
+            not isinstance(remote_target_id, str)
+            or not remote_target_id.strip()
+            or len(remote_target_id) > 256
+        ):
+            raise ValueError("remote_target_id must contain 1 to 256 characters.")
+        target = remote_target_id.strip()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            config = connection.execute(
+                "SELECT enabled, remote_target_id FROM remote_checkpoint_config "
+                "WHERE singleton = 1"
+            ).fetchone()
+            if config is None or config["enabled"] != 1:
+                raise IntegrityError("Remote checkpoint outbox is not enabled.")
+            existing = config["remote_target_id"]
+            if existing is None:
+                connection.execute(
+                    "UPDATE remote_checkpoint_config SET remote_target_id = ? "
+                    "WHERE singleton = 1 AND remote_target_id IS NULL",
+                    (target,),
+                )
+            elif existing != target:
+                raise IntegrityError(
+                    "This local ledger is already bound to a different remote target."
+                )
+            connection.execute("COMMIT")
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
     def get_remote_checkpoint_state(
         self,
     ) -> tuple[int, str, RemoteCheckpointOutboxItem | None]:
@@ -467,10 +516,16 @@ class TransactionalLedgerManager:
         try:
             connection.execute("BEGIN")
             config = connection.execute(
-                "SELECT enabled FROM remote_checkpoint_config WHERE singleton = 1"
+                "SELECT enabled, remote_target_id FROM remote_checkpoint_config "
+                "WHERE singleton = 1"
             ).fetchone()
-            if config is None or config["enabled"] != 1:
-                raise ValueError("Remote checkpoint outbox is not enabled.")
+            if (
+                config is None
+                or config["enabled"] != 1
+                or not isinstance(config["remote_target_id"], str)
+                or not config["remote_target_id"]
+            ):
+                raise ValueError("Remote checkpoint outbox is not enabled and bound.")
             meta = connection.execute(
                 "SELECT head_hash, record_count FROM ledger_meta WHERE singleton = 1"
             ).fetchone()
@@ -528,12 +583,17 @@ class TransactionalLedgerManager:
         finally:
             connection.close()
 
-    def mark_remote_checkpoint_delivered(
-        self, sequence: int, checkpoint_id: str
-    ) -> None:
-        """Mark a checkpoint delivered only after its signed response is verified."""
-        if not checkpoint_id or len(checkpoint_id) > 256:
-            raise ValueError("checkpoint_id must contain 1 to 256 characters.")
+    def mark_remote_checkpoint_delivered(self, receipt: VerifiedChainHead) -> None:
+        """Mark delivery only from a verified receipt matching the persisted request."""
+        if (
+            not isinstance(receipt, VerifiedChainHead)
+            or receipt.sequence < 1
+            or not receipt.checkpoint_id
+            or len(receipt.checkpoint_id) > 256
+            or receipt.previous_hash is None
+            or receipt.record_hash is None
+        ):
+            raise ValueError("A verified checkpoint receipt is required.")
         delivered_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
             "+00:00", "Z"
         )
@@ -541,14 +601,26 @@ class TransactionalLedgerManager:
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT status, checkpoint_id FROM remote_checkpoint_outbox "
-                "WHERE sequence = ?",
-                (sequence,),
+                """
+                SELECT o.status, o.checkpoint_id, o.previous_hash, o.record_hash,
+                       o.chain_hash, c.remote_target_id
+                FROM remote_checkpoint_outbox AS o
+                JOIN remote_checkpoint_config AS c ON c.singleton = 1
+                WHERE o.sequence = ?
+                """,
+                (receipt.sequence,),
             ).fetchone()
             if row is None:
                 raise IntegrityError("Remote checkpoint outbox entry was not found.")
+            if (
+                row["remote_target_id"] != receipt.target_id
+                or row["previous_hash"] != receipt.previous_hash
+                or row["record_hash"] != receipt.record_hash
+                or row["chain_hash"] != receipt.chain_hash
+            ):
+                raise IntegrityError("Verified receipt does not match the bound outbox entry.")
             if row["status"] == "delivered":
-                if row["checkpoint_id"] != checkpoint_id:
+                if row["checkpoint_id"] != receipt.checkpoint_id:
                     raise IntegrityError("Remote checkpoint receipt conflicts with stored receipt.")
                 connection.execute("COMMIT")
                 return
@@ -559,7 +631,7 @@ class TransactionalLedgerManager:
                     last_error = NULL
                 WHERE sequence = ? AND status = 'pending'
                 """,
-                (checkpoint_id, delivered_at, sequence),
+                (receipt.checkpoint_id, delivered_at, receipt.sequence),
             )
             if cursor.rowcount != 1:
                 raise IntegrityError("Remote checkpoint delivery state changed unexpectedly.")
