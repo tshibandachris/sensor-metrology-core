@@ -49,6 +49,16 @@ class DuplicateJsonKeyError(ValueError):
     """A JSON object contains a repeated key."""
 
 
+class PosixLockable(Protocol):
+    """Minimal interface required from the POSIX fcntl module."""
+
+    LOCK_EX: int
+    LOCK_UN: int
+
+    def flock(self, fd: int, operation: int) -> None:
+        """Acquire or release an advisory lock on an open file descriptor."""
+
+
 class WindowsLockable(Protocol):
     """Minimal interface required from the Windows msvcrt module."""
 
@@ -431,13 +441,13 @@ class ChronologicalLedgerManager:
                     lock_stream.seek(0)
                     windows_lock.locking(lock_stream.fileno(), windows_lock.LK_UNLCK, 1)
             else:
-                import fcntl
-
-                fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+                imported_module = importlib.import_module("fcntl")
+                posix_lock = cast(PosixLockable, imported_module)
+                posix_lock.flock(lock_stream.fileno(), posix_lock.LOCK_EX)
                 try:
                     yield
                 finally:
-                    fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+                    posix_lock.flock(lock_stream.fileno(), posix_lock.LOCK_UN)
 
     def verify(self, expected_head_hash: str | None = None) -> int:
         """Verify the complete ledger against an optional externally held head hash.
