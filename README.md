@@ -200,10 +200,51 @@ checks, idempotent POST retries, conflicting idempotency detection, and a
 simulated lost response after commit. It is test infrastructure only and is
 not a production checkpoint service.
 
-**Important:** the client method does not itself make a local SQLite append
-and a remote HTTP checkpoint atomic. Before production integration, the exact
-request body and idempotency key must be committed to a durable local outbox
-in the same SQLite transaction as the ledger append. An uncertain request
-must be retried byte-for-byte with the same idempotency key. Until that
-outbox/reconciliation layer exists, this bridge must be treated as a protocol
-client and not as an automatic remote-anchoring guarantee.
+### Durable SQLite outbox and reconciliation
+
+Remote anchoring is opt-in. Enable it when creating the transactional ledger:
+
+```python
+from pathlib import Path
+
+from remote_trust_bridge import RemoteTrustBridge
+from remote_trust_outbox import RemoteTrustSynchronizer
+from transactional_ledger import TransactionalLedgerManager
+
+ledger = TransactionalLedgerManager(
+    Path("data/metrology.sqlite3"),
+    remote_checkpointing=True,
+)
+bridge = RemoteTrustBridge()
+synchronizer = RemoteTrustSynchronizer(ledger, bridge)
+
+# Call after local appends, or from a supervised background worker.
+synchronizer.synchronize(max_checkpoints=100)
+```
+
+Alternatively, call `ledger.enable_remote_outbox()` on an existing database.
+It verifies the local ledger and atomically enables the outbox while backfilling
+all historical records in sequence. Repeated enable calls are idempotent.
+
+When remote anchoring is enabled:
+
+- The ledger record and its pending outbox row commit in the **same SQLite
+  transaction**.
+- A later new append is blocked while an earlier checkpoint is pending, so
+  the remote sequence cannot skip ahead.
+- The outbox stores the exact sequence, hashes, and idempotency key. A timeout
+  leaves the row pending; the synchronizer replays the exact request and key.
+- A row is marked delivered only after the signed receipt has been verified.
+- A mismatched, stale, or unexpectedly advanced remote head fails closed;
+  the synchronizer never resets either ledger.
+- Existing history is backfilled before remote synchronization starts.
+
+The configured `REMOTE_TRUST_TARGET_ID` identifies the **whole ledger stream**,
+not an individual sensor's `target_id`: the remote sequence follows the
+global SQLite ledger sequence. Keep one stable remote target ID per ledger.
+
+The outbox provides durable delivery state, not a production remote service.
+The remote witness must still be independently operated, use atomic
+compare-and-swap semantics, protect its signing key in a KMS/HSM, and enforce
+target-scoped authorization. The local SQLite database and its WAL/SHM files
+must be protected with operating-system access controls.
