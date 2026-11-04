@@ -79,10 +79,13 @@ class TransactionalLedgerTests(unittest.TestCase):
         )
         self.assertEqual(self.ledger.verify(), 2)
 
-        with sqlite3.connect(self.database_path) as connection:
+        connection = sqlite3.connect(self.database_path)
+        try:
             row = connection.execute(
                 "SELECT head_hash FROM ledger_meta WHERE singleton = 1"
             ).fetchone()
+        finally:
+            connection.close()
         if row is None or not isinstance(row[0], str):
             raise AssertionError("Expected a string chain head in ledger metadata.")
         self.assertEqual(self.ledger.verify(expected_head_hash=row[0]), 2)
@@ -144,7 +147,8 @@ class TransactionalLedgerTests(unittest.TestCase):
 
     def test_record_rows_are_append_only_through_sql_api(self) -> None:
         self.append_baseline()
-        with sqlite3.connect(self.database_path) as connection:
+        connection = sqlite3.connect(self.database_path)
+        try:
             with self.assertRaises(sqlite3.IntegrityError):
                 connection.execute(
                     "UPDATE ledger_records SET target_id = 'changed' "
@@ -154,16 +158,21 @@ class TransactionalLedgerTests(unittest.TestCase):
                 connection.execute(
                     "DELETE FROM ledger_records WHERE record_id = 'baseline-001'"
                 )
+        finally:
+            connection.close()
         self.assertEqual(self.ledger.verify(), 1)
 
     def test_integrity_verification_detects_direct_database_tampering(self) -> None:
         self.append_baseline()
-        with sqlite3.connect(self.database_path) as connection:
+        connection = sqlite3.connect(self.database_path)
+        try:
             connection.execute("DROP TRIGGER ledger_records_no_update")
             connection.execute(
                 "UPDATE ledger_records SET record_json = '{}' "
                 "WHERE record_id = 'baseline-001'"
             )
+        finally:
+            connection.close()
         with self.assertRaises(IntegrityError):
             self.ledger.verify()
 
