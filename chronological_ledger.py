@@ -209,7 +209,7 @@ class ChronologicalLedgerManager:
         temporary_path = Path(temporary_name)
         try:
             with os.fdopen(descriptor, "wb") as stream:
-                stream.write((chain_hash + "\\n").encode("ascii"))
+                stream.write((chain_hash + "\n").encode("ascii"))
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary_path, checkpoint_path)
