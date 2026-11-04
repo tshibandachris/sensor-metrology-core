@@ -12,3 +12,8 @@ reports/*.json
 
 .DS_Store
 Thumbs.db
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/*.sqlite3-wal
+data/*.sqlite3-shm
