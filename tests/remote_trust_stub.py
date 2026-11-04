@@ -170,7 +170,12 @@ class RemoteTrustStub:
                     else:
                         current_sequence = fixture._head["sequence"]
                         current_hash = fixture._head["chain_hash"]
-                        if sequence != current_sequence + 1 or previous_hash != current_hash:
+                        if (
+                            type(current_sequence) is not int
+                            or not isinstance(current_hash, str)
+                            or sequence != current_sequence + 1
+                            or previous_hash != current_hash
+                        ):
                             self._send(409, {"error": "stale_head"})
                             return
                         checkpoint_id = f"checkpoint-{sequence}"
