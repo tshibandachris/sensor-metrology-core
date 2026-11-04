@@ -28,6 +28,7 @@ sensor-metrology-core/
 │   └── test_transactional_ledger.py
 ├── chronological_ledger.py
 ├── transactional_ledger.py
+├── remote_trust_bridge.py
 ├── sensor_integrity_auditor.py
 ├── requirements.txt
 └── README.md
@@ -77,7 +78,7 @@ If coordinated multi-writer transactions are required, add an explicit inter-pro
 
 ## Local setup
 
-Python 3.12 is recommended. The current implementation uses only the Python standard library.
+Python 3.12 is recommended. The sensor auditor and local ledger use the Python standard library. The remote trust bridge uses the maintained `cryptography` package for Ed25519 signature verification.
 
 ```bash
 python -m venv .venv
@@ -173,3 +174,36 @@ unchanged and verified during any migration. A dedicated, tested importer with
 an explicit preservation policy is required before moving production history.
 Do not open a JSONL ledger using the SQLite manager or point both managers at
 the same path.
+
+
+## Remote trust checkpoint bridge (feature branch)
+
+The optional `remote_trust_bridge.py` client communicates with the v1 remote
+checkpoint protocol in `docs/remote-checkpoint-protocol.md`. It verifies
+Ed25519-signed head and receipt envelopes against public keys pinned locally.
+It rejects redirects, non-HTTPS remote URLs (except loopback test URLs),
+unknown signing keys, malformed or non-canonical payloads, invalid hashes,
+unexpected fields, and oversized responses.
+
+Install the runtime dependency with `python -m pip install -r requirements.txt`.
+Configure these environment variables before constructing the client:
+
+- `REMOTE_TRUST_BASE_URL`: HTTPS base URL of the independently operated service.
+- `REMOTE_TRUST_TOKEN`: target-scoped bearer credential.
+- `REMOTE_TRUST_TARGET_ID`: target identifier.
+- `REMOTE_TRUST_PUBLIC_KEYS`: JSON object mapping each trusted `key_id` to
+  its raw 32-byte Ed25519 public key encoded as unpadded base64url.
+
+The `tests/remote_trust_stub.py` fixture starts a loopback-only HTTP server
+for offline protocol tests. It supports signed GET responses, atomic sequence
+checks, idempotent POST retries, conflicting idempotency detection, and a
+simulated lost response after commit. It is test infrastructure only and is
+not a production checkpoint service.
+
+**Important:** the client method does not itself make a local SQLite append
+and a remote HTTP checkpoint atomic. Before production integration, the exact
+request body and idempotency key must be committed to a durable local outbox
+in the same SQLite transaction as the ledger append. An uncertain request
+must be retried byte-for-byte with the same idempotency key. Until that
+outbox/reconciliation layer exists, this bridge must be treated as a protocol
+client and not as an automatic remote-anchoring guarantee.
