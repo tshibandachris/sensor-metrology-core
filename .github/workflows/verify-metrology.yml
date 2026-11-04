@@ -43,9 +43,9 @@ jobs:
         run: |
           python -m pip install mypy types-setuptools
 
-      - name: Mandatory ledger strict typing gate
+      - name: Mandatory ledger and integrity-test strict typing gate
         run: |
-          mypy --strict chronological_ledger.py
+          mypy --strict chronological_ledger.py tests/test_ledger_integrity.py
 
       - name: Mandatory auditor strict typing gate
         run: |
