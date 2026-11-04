@@ -169,7 +169,23 @@ class ChronologicalLedgerManager:
         ledger_path: Path,
         hmac_secret: bytes | None = None,
     ) -> None:
-        if hmac_secret is not None and len(hmac_secret) < 32:
+        """Initialize the ledger with an in-memory HMAC key.
+
+        Production callers should omit hmac_secret and provide
+        METROLOGY_SIGNING_KEY through the process environment or a
+        secret-injection mechanism. The value is read at construction time,
+        encoded in memory, and is never written to the ledger or checkpoint.
+        Explicit bytes are supported for controlled tests and secret managers.
+        """
+        if hmac_secret is None:
+            environment_secret = os.environ.get("METROLOGY_SIGNING_KEY")
+            if environment_secret is None:
+                raise ValueError(
+                    "METROLOGY_SIGNING_KEY must be provided through the runtime "
+                    "environment or hmac_secret."
+                )
+            hmac_secret = environment_secret.encode("utf-8")
+        if len(hmac_secret) < 32:
             raise ValueError("hmac_secret must contain at least 32 bytes.")
         self.ledger_path = ledger_path
         self._hmac_secret = hmac_secret
@@ -423,25 +439,42 @@ class ChronologicalLedgerManager:
                 finally:
                     fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
 
-    def verify(self, checkpoint_path: Path | None = None) -> int:
-        """Verify the ledger and, optionally, its independently stored checkpoint."""
+    def verify(self, expected_head_hash: str | None = None) -> int:
+        """Verify the complete ledger against an optional externally held head hash.
+
+        expected_head_hash must come from a trust domain that cannot be
+        rewritten by an actor who can modify ledger_path (for example, a
+        remote append-only store or a separately protected orchestrator).
+        The local checkpoint file is deliberately not consulted: it resides
+        inside the same local write boundary as the ledger and is therefore
+        diagnostic metadata, not an independent trust anchor.
+
+        The expected value is the 64-character lowercase SHA-256 chain head,
+        not a digest of the JSONL file bytes. When supplied, it detects
+        rewriting, truncation, replacement, and re-chaining of the local file,
+        provided the external reference itself remains protected.
+        """
+        if expected_head_hash is not None and (
+            len(expected_head_hash) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_head_hash
+            )
+        ):
+            raise IntegrityError(
+                "Externally supplied expected_head_hash must be a "
+                "64-character lowercase SHA-256 value."
+            )
+
         with self._writer_lock():
             records, _, _, _, final_chain_hash = self._load_verified()
-            if checkpoint_path is not None:
-                try:
-                    checkpoint = checkpoint_path.read_text(encoding="ascii").strip()
-                except (OSError, UnicodeDecodeError) as exc:
-                    raise IntegrityError(
-                        f"Unable to read detached checkpoint: {exc}"
-                    ) from exc
-                if (
-                    len(checkpoint) != 64
-                    or any(character not in "0123456789abcdef" for character in checkpoint)
-                    or not hmac.compare_digest(checkpoint, final_chain_hash)
-                ):
-                    raise IntegrityError(
-                        "Detached checkpoint does not match the verified ledger head."
-                    )
+            if expected_head_hash is not None and not hmac.compare_digest(
+                expected_head_hash, final_chain_hash
+            ):
+                raise IntegrityError(
+                    "Verified ledger head does not match the externally "
+                    "anchored expected_head_hash."
+                )
             return len(records)
 
     def append_baseline(
