@@ -11,7 +11,7 @@ from urllib.error import URLError
 from unittest.mock import patch
 
 from chronological_ledger import IntegrityError
-from remote_trust_bridge import RemoteTrustBridge
+from remote_trust_bridge import RemoteTrustBridge, VerifiedChainHead
 from remote_trust_outbox import RemoteTrustSynchronizer
 from remote_trust_stub import RemoteTrustStub
 from transactional_ledger import (
@@ -196,6 +196,36 @@ class RemoteTrustOutboxTests(unittest.TestCase):
         pending = self.ledger.get_remote_checkpoint_state()[2]
         self.assertIsNotNone(pending)
         self.assertEqual(self.stub.sequence, 1)
+
+    def test_ledger_cannot_be_rebound_to_another_remote_target(self) -> None:
+        other_bridge = RemoteTrustBridge(
+            base_url=self.stub.base_url,
+            token="test-token",
+            target_id="different-ledger",
+            trusted_public_keys=self.stub.public_keys,
+        )
+        with self.assertRaises(IntegrityError):
+            RemoteTrustSynchronizer(self.ledger, other_bridge)
+
+    def test_delivery_rejects_receipt_not_matching_persisted_outbox(self) -> None:
+        self.append_baseline()
+        pending = self.ledger.get_remote_checkpoint_state()[2]
+        self.assertIsNotNone(pending)
+        if pending is None:
+            self.fail("Expected a durable pending checkpoint.")
+        forged = VerifiedChainHead(
+            key_id="test-ed25519-key",
+            target_id="ledger-001",
+            sequence=pending.sequence,
+            chain_hash="f" * 64,
+            checkpoint_id="forged-checkpoint",
+            issued_at="2026-11-04T12:00:00Z",
+            previous_hash=pending.previous_hash,
+            record_hash=pending.record_hash,
+        )
+        with self.assertRaises(IntegrityError):
+            self.ledger.mark_remote_checkpoint_delivered(forged)
+        self.assertIsNotNone(self.ledger.get_remote_checkpoint_state()[2])
 
     def test_remote_outbox_is_opt_in_for_existing_ledger(self) -> None:
         disabled = TransactionalLedgerManager(
