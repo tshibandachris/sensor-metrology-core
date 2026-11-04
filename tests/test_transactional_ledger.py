@@ -83,7 +83,8 @@ class TransactionalLedgerTests(unittest.TestCase):
             row = connection.execute(
                 "SELECT head_hash FROM ledger_meta WHERE singleton = 1"
             ).fetchone()
-        self.assertIsNotNone(row)
+        if row is None or not isinstance(row[0], str):
+            raise AssertionError("Expected a string chain head in ledger metadata.")
         self.assertEqual(self.ledger.verify(expected_head_hash=row[0]), 2)
         with self.assertRaises(IntegrityError):
             self.ledger.verify(expected_head_hash="0" * 64)
