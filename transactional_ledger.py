@@ -377,7 +377,7 @@ class TransactionalLedgerManager:
                         parse_constant=_reject_json_constant,
                     )
                     record = assert_json_object(decoded)
-                except (ValueError, TypeError) as exc:
+                except (ValueError, TypeError, InvalidRecordError) as exc:
                     raise IntegrityError(
                         f"Invalid stored record at sequence {row['sequence']}."
                     ) from exc
