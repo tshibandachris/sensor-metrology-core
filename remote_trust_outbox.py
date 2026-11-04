@@ -27,7 +27,7 @@ class RemoteTrustSynchronizer:
         self.ledger = ledger
         self.bridge = bridge
 
-    def synchronize_one(self) -> SyncResult:
+    def _synchronize_one(self) -> SyncResult:
         """Deliver or reconcile the earliest pending checkpoint.
 
         A signed remote head that is exactly one sequence ahead is not enough
@@ -90,13 +90,19 @@ class RemoteTrustSynchronizer:
             "Local outbox changed during remote reconciliation; retry synchronization."
         )
 
+    def synchronize_one(self) -> SyncResult:
+        """Verify the complete local ledger, then process one checkpoint."""
+        self.ledger.verify()
+        return self._synchronize_one()
+
     def synchronize(self, max_checkpoints: int = 100) -> int:
         """Drain up to max_checkpoints in order and return processed count."""
         if type(max_checkpoints) is not int or not 1 <= max_checkpoints <= 10_000:
             raise ValueError("max_checkpoints must be an integer from 1 to 10000.")
+        self.ledger.verify()
         processed = 0
         while processed < max_checkpoints:
-            result = self.synchronize_one()
+            result = self._synchronize_one()
             if result == "in_sync":
                 break
             processed += 1
