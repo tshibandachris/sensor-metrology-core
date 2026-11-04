@@ -96,6 +96,21 @@ class RemoteTrustBridgeTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.bridge.fetch_expected_chain_head()
 
+    def test_invalid_bearer_token_is_rejected_by_live_local_server(self) -> None:
+        invalid_bridge = RemoteTrustBridge(
+            base_url=self.stub.base_url,
+            token="invalid-token",
+            target_id="sensor-001",
+            trusted_public_keys=self.stub.public_keys,
+        )
+        with self.assertRaises(IOError):
+            invalid_bridge.fetch_expected_chain_head()
+
+    def test_malformed_json_from_live_local_server_is_rejected(self) -> None:
+        self.stub.malformed_next_get_response = True
+        with self.assertRaises(RuntimeError):
+            self.bridge.fetch_expected_chain_head()
+
     def test_invalid_signature_is_rejected(self) -> None:
         payload = {
             "protocol_version": 1,
