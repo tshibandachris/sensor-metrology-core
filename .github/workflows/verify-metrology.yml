@@ -9,9 +9,11 @@ on:
       - feature/sqlite-transactional-ledger
       - feature/remote-trust-checkpoint
       - feature/tls-transport-layer
+      - feature/witness-key-ops-hardening
   pull_request:
     branches:
       - main
+      - feature/tls-transport-layer
 
 permissions:
   contents: read
