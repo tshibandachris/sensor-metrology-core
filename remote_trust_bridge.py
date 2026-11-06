@@ -13,9 +13,17 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Mapping
+from email.message import Message
+from typing import IO, Mapping
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+from witness_key_loader import (
+    KeyNotFoundError,
+    KeyRegistryFormatError,
+    KeyRevokedError,
+    WitnessKeyLoader,
+)
 
 _HEX_256 = re.compile(r"^[0-9a-f]{64}$")
 _B64URL = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -34,10 +42,10 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(
         self,
         req: urllib.request.Request,
-        fp: Any,
+        fp: IO[bytes],
         code: int,
         msg: str,
-        headers: Any,
+        headers: Message,
         newurl: str,
     ) -> urllib.request.Request | None:
         return None
@@ -98,9 +106,11 @@ def _validate_local_digest(value: object, field: str) -> str:
 class RemoteTrustBridge:
     """Communicate with a remote witness and verify every signed response.
 
-    Public keys are raw 32-byte Ed25519 keys indexed by the server's key_id.
-    Production deployments should inject these pinned keys from trusted
-    configuration, not accept keys supplied by the remote response.
+    Public keys are resolved by key_id from a local, versioned trusted-key
+    registry. The registry is read for each signed response so rotations and
+    revocations take effect without restarting the client. The deprecated
+    trusted_public_keys argument remains only for existing isolated tests;
+    production clients should use the registry-backed loader.
     """
 
     def __init__(
@@ -110,6 +120,7 @@ class RemoteTrustBridge:
         target_id: str | None = None,
         trusted_public_keys: Mapping[str, bytes] | None = None,
         timeout_seconds: float = 5.0,
+        witness_key_loader: WitnessKeyLoader | None = None,
         ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         self.base_url = (base_url or os.environ.get("REMOTE_TRUST_BASE_URL", "")).rstrip("/")
@@ -142,30 +153,34 @@ class RemoteTrustBridge:
             # Non-standard HTTPS ports are allowed for controlled deployments.
             pass
 
-        if trusted_public_keys is None:
-            raw_keys = os.environ.get("REMOTE_TRUST_PUBLIC_KEYS", "")
-            if not raw_keys:
-                raise ValueError("REMOTE_TRUST_PUBLIC_KEYS must contain pinned public keys.")
-            try:
-                decoded_keys: object = json.loads(
-                    raw_keys, object_pairs_hook=_reject_duplicate_keys
-                )
-            except (json.JSONDecodeError, ValueError) as exc:
-                raise ValueError("REMOTE_TRUST_PUBLIC_KEYS is invalid JSON.") from exc
-            if not isinstance(decoded_keys, dict):
-                raise ValueError("REMOTE_TRUST_PUBLIC_KEYS must be a JSON object.")
-            parsed_keys: dict[str, bytes] = {}
-            for key_id, encoded_key in decoded_keys.items():
-                parsed_keys[key_id] = _decode_b64url(encoded_key, "public key")
-            trusted_public_keys = parsed_keys
+        if witness_key_loader is not None and trusted_public_keys is not None:
+            raise ValueError(
+                "Configure witness_key_loader or trusted_public_keys, not both."
+            )
 
-        if not trusted_public_keys:
-            raise ValueError("At least one pinned Ed25519 public key is required.")
+        self._key_loader = witness_key_loader
         self._public_keys: dict[str, Ed25519PublicKey] = {}
-        for key_id, raw_key in trusted_public_keys.items():
-            if not key_id or len(key_id) > 128 or not isinstance(raw_key, bytes) or len(raw_key) != 32:
-                raise ValueError("Each trusted key needs a key_id and 32 raw bytes.")
-            self._public_keys[key_id] = Ed25519PublicKey.from_public_bytes(raw_key)
+        if self._key_loader is None and trusted_public_keys is None:
+            registry_path = os.environ.get(
+                "REMOTE_TRUST_KEY_REGISTRY", "docs/trusted_witness_keys.json"
+            )
+            self._key_loader = WitnessKeyLoader(registry_path)
+
+        # Compatibility path for existing unit fixtures. Production defaults
+        # to the versioned registry and never accepts keys from the response.
+        if trusted_public_keys is not None:
+            if not trusted_public_keys:
+                raise ValueError("At least one trusted Ed25519 public key is required.")
+            for key_id, raw_key in trusted_public_keys.items():
+                if (
+                    not isinstance(key_id, str)
+                    or not key_id
+                    or len(key_id) > 128
+                    or not isinstance(raw_key, bytes)
+                    or len(raw_key) != 32
+                ):
+                    raise ValueError("Each trusted key needs a key_id and 32 raw bytes.")
+                self._public_keys[key_id] = Ed25519PublicKey.from_public_bytes(raw_key)
 
         if ssl_context is None:
             self._opener = urllib.request.build_opener(_NoRedirect())
@@ -217,12 +232,31 @@ class RemoteTrustBridge:
         }:
             raise RuntimeError("Signed response envelope has unexpected fields.")
         key_id = envelope.get("key_id")
-        if not isinstance(key_id, str) or key_id not in self._public_keys:
-            raise RuntimeError("Remote trust response uses an unknown signing key.")
+        if not isinstance(key_id, str) or not key_id or len(key_id) > 128:
+            raise RuntimeError("Remote trust response has an invalid signing key_id.")
+
+        if self._key_loader is not None:
+            try:
+                raw_public_key = self._key_loader.load_public_key_bytes(key_id)
+            except (KeyNotFoundError, KeyRevokedError, KeyRegistryFormatError) as exc:
+                raise RuntimeError(
+                    f"Remote trust signing key {key_id!r} is unknown, revoked, or invalid."
+                ) from exc
+            try:
+                public_key = Ed25519PublicKey.from_public_bytes(raw_public_key)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Trusted witness key {key_id!r} is not a valid Ed25519 public key."
+                ) from exc
+        else:
+            public_key = self._public_keys.get(key_id)
+            if public_key is None:
+                raise RuntimeError("Remote trust response uses an unknown signing key.")
+
         payload_bytes = _decode_b64url(envelope.get("payload"), "payload")
         signature = _decode_b64url(envelope.get("signature"), "signature")
         try:
-            self._public_keys[key_id].verify(signature, payload_bytes)
+            public_key.verify(signature, payload_bytes)
         except (InvalidSignature, ValueError) as exc:
             raise RuntimeError("Remote trust response signature is invalid.") from exc
         try:
