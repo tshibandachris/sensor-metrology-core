@@ -207,16 +207,16 @@ class ServerCommunicationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             registry_path = root / "trusted_witness_keys.json"
+            key_entry: dict[str, object] = {
+                "algorithm": "Ed25519",
+                "public_key_b64url": encoded_public,
+                "activated_at_utc": "2026-11-06T09:00:00Z",
+                "revoked": False,
+            }
+            keys: dict[str, object] = {key_id: key_entry}
             manifest: dict[str, object] = {
                 "metadata": {"schema_version": "1.0"},
-                "keys": {
-                    key_id: {
-                        "algorithm": "Ed25519",
-                        "public_key_b64url": encoded_public,
-                        "activated_at_utc": "2026-11-06T09:00:00Z",
-                        "revoked": False,
-                    }
-                },
+                "keys": keys,
             }
             registry_path.write_text(
                 json.dumps(manifest, sort_keys=True),
@@ -261,10 +261,6 @@ class ServerCommunicationTests(unittest.TestCase):
                 self.assertEqual(receipt.sequence, 1)
                 self.assertEqual(receipt.chain_hash, first_chain)
 
-                keys_value = manifest["keys"]
-                self.assertIsInstance(keys_value, dict)
-                key_entry = keys_value[key_id]
-                self.assertIsInstance(key_entry, dict)
                 key_entry["revoked"] = True
                 registry_path.write_text(
                     json.dumps(manifest, sort_keys=True),
