@@ -235,6 +235,7 @@ class RemoteTrustBridge:
         if not isinstance(key_id, str) or not key_id or len(key_id) > 128:
             raise RuntimeError("Remote trust response has an invalid signing key_id.")
 
+        public_key: Ed25519PublicKey | None = None
         if self._key_loader is not None:
             try:
                 raw_public_key = self._key_loader.load_public_key_bytes(key_id)
@@ -250,8 +251,8 @@ class RemoteTrustBridge:
                 ) from exc
         else:
             public_key = self._public_keys.get(key_id)
-            if public_key is None:
-                raise RuntimeError("Remote trust response uses an unknown signing key.")
+        if public_key is None:
+            raise RuntimeError("Remote trust response uses an unknown signing key.")
 
         payload_bytes = _decode_b64url(envelope.get("payload"), "payload")
         signature = _decode_b64url(envelope.get("signature"), "signature")
