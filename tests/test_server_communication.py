@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import tempfile
 import threading
 import unittest
@@ -14,6 +15,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from remote_trust_bridge import RemoteTrustBridge
 from sensor_trust_server import build_server
+from witness_key_loader import WitnessKeyLoader
 
 
 class ServerCommunicationTests(unittest.TestCase):
@@ -176,6 +178,111 @@ class ServerCommunicationTests(unittest.TestCase):
                     trusted_public_keys={"integration-key-1": public_key},
                 ).fetch_expected_chain_head()
                 self.assertEqual(final_head.sequence, 1)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+
+    def test_verification_with_rotated_and_revoked_keys(self) -> None:
+        """Resolve a rotated key dynamically, then reject it after revocation."""
+        key_id = "integration-rotated-witness-2026"
+        private_key = Ed25519PrivateKey.generate()
+        raw_private = private_key.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        encoded_private = (
+            base64.urlsafe_b64encode(raw_private).rstrip(b"=").decode("ascii")
+        )
+        raw_public = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        encoded_public = (
+            base64.urlsafe_b64encode(raw_public).rstrip(b"=").decode("ascii")
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry_path = root / "trusted_witness_keys.json"
+            manifest: dict[str, object] = {
+                "metadata": {"schema_version": "1.0"},
+                "keys": {
+                    key_id: {
+                        "algorithm": "Ed25519",
+                        "public_key_b64url": encoded_public,
+                        "activated_at_utc": "2026-11-06T09:00:00Z",
+                        "revoked": False,
+                    }
+                },
+            }
+            registry_path.write_text(
+                json.dumps(manifest, sort_keys=True),
+                encoding="utf-8",
+            )
+            loader = WitnessKeyLoader(registry_path)
+
+            server = build_server(
+                database_path=root / "rotated-witness.sqlite3",
+                host="127.0.0.1",
+                port=0,
+                auth_token="rotated-integration-secret",
+                private_key_value=encoded_private,
+                key_id=key_id,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                bridge = RemoteTrustBridge(
+                    base_url=f"http://127.0.0.1:{server.server_address[1]}",
+                    token="rotated-integration-secret",
+                    target_id="rotated-sensor",
+                    witness_key_loader=loader,
+                )
+                genesis = bridge.fetch_expected_chain_head()
+                self.assertEqual(genesis.key_id, key_id)
+                self.assertEqual(genesis.sequence, 0)
+
+                previous_hash = genesis.chain_hash
+                first_record = hashlib.sha256(b"rotated-record-001").hexdigest()
+                first_chain = hashlib.sha256(
+                    f"{previous_hash}:{first_record}".encode("ascii")
+                ).hexdigest()
+                receipt = bridge.post_new_chain_head(
+                    sequence=1,
+                    previous_hash=previous_hash,
+                    record_hash=first_record,
+                    chain_hash=first_chain,
+                    idempotency_key="rotated-append-001",
+                )
+                self.assertEqual(receipt.key_id, key_id)
+                self.assertEqual(receipt.sequence, 1)
+                self.assertEqual(receipt.chain_hash, first_chain)
+
+                keys_value = manifest["keys"]
+                self.assertIsInstance(keys_value, dict)
+                key_entry = keys_value[key_id]
+                self.assertIsInstance(key_entry, dict)
+                key_entry["revoked"] = True
+                registry_path.write_text(
+                    json.dumps(manifest, sort_keys=True),
+                    encoding="utf-8",
+                )
+
+                second_record = hashlib.sha256(b"rotated-record-002").hexdigest()
+                second_chain = hashlib.sha256(
+                    f"{first_chain}:{second_record}".encode("ascii")
+                ).hexdigest()
+                with self.assertRaisesRegex(RuntimeError, "revoked"):
+                    bridge.post_new_chain_head(
+                        sequence=2,
+                        previous_hash=first_chain,
+                        record_hash=second_record,
+                        chain_hash=second_chain,
+                        idempotency_key="rotated-append-002",
+                    )
             finally:
                 server.shutdown()
                 server.server_close()
