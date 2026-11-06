@@ -449,6 +449,8 @@ def build_server(
         raise ValueError("SERVER_AUTH_TOKEN is required.")
     tls_context: ssl.SSLContext | None = None
     if tls_enabled:
+        assert resolved_certfile is not None
+        assert resolved_keyfile is not None
         tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
         tls_context.load_cert_chain(certfile=resolved_certfile, keyfile=resolved_keyfile)
