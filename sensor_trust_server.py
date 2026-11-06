@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sqlite3
+import ssl
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -415,8 +416,14 @@ def build_server(
     auth_token: str | None = None,
     private_key_value: str | None = None,
     key_id: str | None = None,
+    certfile_path: str | None = None,
+    keyfile_path: str | None = None,
 ) -> RemoteTrustHTTPServer:
-    """Build a configured server; explicit arguments make integration tests isolated."""
+    """Build the witness server, optionally wrapping its listener in TLS.
+
+    TLS remains disabled when neither certificate path is configured. When
+    enabled, both the certificate chain and matching private key are required.
+    """
     resolved_token = auth_token if auth_token is not None else os.environ.get("SERVER_AUTH_TOKEN", "")
     resolved_key = private_key_value if private_key_value is not None else os.environ.get("METROLOGY_PRIVATE_KEY", "")
     resolved_db = database_path if database_path is not None else os.environ.get(
@@ -425,16 +432,25 @@ def build_server(
     resolved_host = host if host is not None else os.environ.get("SERVER_HOST", "127.0.0.1")
     resolved_port = port if port is not None else int(os.environ.get("SERVER_PORT", "8443"))
     resolved_key_id = key_id if key_id is not None else os.environ.get("METROLOGY_KEY_ID", _KEY_ID_DEFAULT)
+    resolved_certfile = certfile_path if certfile_path is not None else os.environ.get("METROLOGY_TLS_CERT")
+    resolved_keyfile = keyfile_path if keyfile_path is not None else os.environ.get("METROLOGY_TLS_KEY")
+    if bool(resolved_certfile) != bool(resolved_keyfile):
+        raise ValueError("METROLOGY_TLS_CERT and METROLOGY_TLS_KEY must be configured together.")
     if not resolved_token:
         raise ValueError("SERVER_AUTH_TOKEN is required.")
     private_key = load_private_key(resolved_key)
-    return RemoteTrustHTTPServer(
+    server = RemoteTrustHTTPServer(
         (resolved_host, resolved_port),
         CheckpointStore(resolved_db),
         resolved_token,
         private_key,
         resolved_key_id,
     )
+    if resolved_certfile is not None and resolved_keyfile is not None:
+        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_context.load_cert_chain(certfile=resolved_certfile, keyfile=resolved_keyfile)
+        server.socket = tls_context.wrap_socket(server.socket, server_side=True)
+    return server
 
 
 def main() -> None:
