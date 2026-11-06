@@ -84,6 +84,8 @@ class CheckpointStore:
         connection = sqlite3.connect(self.database_path, timeout=15.0, isolation_level=None)
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 15000")
+        # synchronous is connection-local; set FULL on every writer connection.
+        connection.execute("PRAGMA synchronous = FULL")
         return connection
 
     def _initialize(self) -> None:
