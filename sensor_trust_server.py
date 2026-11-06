@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -436,8 +437,21 @@ def build_server(
     resolved_keyfile = keyfile_path if keyfile_path is not None else os.environ.get("METROLOGY_TLS_KEY")
     if bool(resolved_certfile) != bool(resolved_keyfile):
         raise ValueError("METROLOGY_TLS_CERT and METROLOGY_TLS_KEY must be configured together.")
+    tls_enabled = resolved_certfile is not None and resolved_keyfile is not None
+    try:
+        bind_ip = ipaddress.ip_address(resolved_host)
+        loopback_only = bind_ip.is_loopback
+    except ValueError:
+        loopback_only = resolved_host.lower() == "localhost"
+    if not tls_enabled and not loopback_only:
+        raise ValueError("TLS is required when binding to a non-loopback address.")
     if not resolved_token:
         raise ValueError("SERVER_AUTH_TOKEN is required.")
+    tls_context: ssl.SSLContext | None = None
+    if tls_enabled:
+        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        tls_context.load_cert_chain(certfile=resolved_certfile, keyfile=resolved_keyfile)
     private_key = load_private_key(resolved_key)
     server = RemoteTrustHTTPServer(
         (resolved_host, resolved_port),
@@ -446,10 +460,12 @@ def build_server(
         private_key,
         resolved_key_id,
     )
-    if resolved_certfile is not None and resolved_keyfile is not None:
-        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        tls_context.load_cert_chain(certfile=resolved_certfile, keyfile=resolved_keyfile)
-        server.socket = tls_context.wrap_socket(server.socket, server_side=True)
+    if tls_context is not None:
+        try:
+            server.socket = tls_context.wrap_socket(server.socket, server_side=True)
+        except Exception:
+            server.server_close()
+            raise
     return server
 
 
