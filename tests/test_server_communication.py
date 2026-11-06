@@ -104,5 +104,83 @@ class ServerCommunicationTests(unittest.TestCase):
                 thread.join(timeout=5)
 
 
+    def test_concurrent_competing_appends_have_one_winner(self) -> None:
+        private_key = Ed25519PrivateKey.generate()
+        raw_private = private_key.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        encoded_private = base64.urlsafe_b64encode(raw_private).rstrip(b"=").decode("ascii")
+        with tempfile.TemporaryDirectory() as directory:
+            server = build_server(
+                database_path=Path(directory) / "concurrent-witness.sqlite3",
+                host="127.0.0.1",
+                port=0,
+                auth_token="integration-secret",
+                private_key_value=encoded_private,
+                key_id="integration-key-1",
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                public_key = private_key.public_key().public_bytes(
+                    encoding=serialization.Encoding.Raw,
+                    format=serialization.PublicFormat.Raw,
+                )
+                base_url = f"http://127.0.0.1:{server.server_address[1]}"
+                barrier = threading.Barrier(2)
+                outcomes: list[tuple[str, object]] = []
+
+                def compete(record: bytes, key: str) -> None:
+                    bridge = RemoteTrustBridge(
+                        base_url=base_url,
+                        token="integration-secret",
+                        target_id="concurrent-sensor",
+                        trusted_public_keys={"integration-key-1": public_key},
+                    )
+                    head = bridge.fetch_expected_chain_head()
+                    record_hash = hashlib.sha256(record).hexdigest()
+                    chain_hash = hashlib.sha256(
+                        f"{head.chain_hash}:{record_hash}".encode("ascii")
+                    ).hexdigest()
+                    barrier.wait(timeout=5)
+                    try:
+                        receipt = bridge.post_new_chain_head(
+                            sequence=1,
+                            previous_hash=head.chain_hash,
+                            record_hash=record_hash,
+                            chain_hash=chain_hash,
+                            idempotency_key=key,
+                        )
+                        outcomes.append(("accepted", receipt))
+                    except IOError as exc:
+                        outcomes.append(("rejected", exc))
+
+                workers = [
+                    threading.Thread(target=compete, args=(b"candidate-a", "candidate-a")),
+                    threading.Thread(target=compete, args=(b"candidate-b", "candidate-b")),
+                ]
+                for worker in workers:
+                    worker.start()
+                for worker in workers:
+                    worker.join(timeout=10)
+                    self.assertFalse(worker.is_alive(), "Concurrent append did not finish.")
+
+                self.assertEqual(sum(kind == "accepted" for kind, _ in outcomes), 1)
+                self.assertEqual(sum(kind == "rejected" for kind, _ in outcomes), 1)
+                final_head = RemoteTrustBridge(
+                    base_url=base_url,
+                    token="integration-secret",
+                    target_id="concurrent-sensor",
+                    trusted_public_keys={"integration-key-1": public_key},
+                ).fetch_expected_chain_head()
+                self.assertEqual(final_head.sequence, 1)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+
 if __name__ == "__main__":
     unittest.main()
