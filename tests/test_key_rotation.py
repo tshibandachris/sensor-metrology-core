@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -54,6 +56,10 @@ class WitnessKeyRotationTests(unittest.TestCase):
         loaded = serialization.load_pem_private_key(pem, password=b"a-long-test-passphrase")
         self.assertIsInstance(loaded, ed25519.Ed25519PrivateKey)
 
+    def test_encrypted_pem_rejects_noncanonical_private_key(self) -> None:
+        with self.assertRaisesRegex(ValueError, "canonical Base64url"):
+            rotation.encrypted_pem("not-a-private-key", "a-long-test-passphrase")
+
     def test_registry_accumulates_keys_without_overwriting_history(self) -> None:
         _, public_v1 = rotation.generate_key_pair("key-v1")
         _, public_v2 = rotation.generate_key_pair("key-v2")
@@ -90,6 +96,58 @@ class WitnessKeyRotationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "lock already exists"):
             rotation.update_public_registry("locked-test", public_key)
         self.assertFalse(self.registry_mock.exists())
+
+    def test_rotation_refuses_to_generate_without_secure_destination(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            result = rotation.execute_rotation("no-destination")
+        self.assertEqual(result, 2)
+        self.assertFalse(self.registry_mock.exists())
+        self.assertNotIn("METROLOGY_PRIVATE_KEY", stdout.getvalue())
+        self.assertIn("Refusing to generate a key", stderr.getvalue())
+
+    def test_encrypted_rotation_never_prints_raw_private_key(self) -> None:
+        pem_path = self.root / "private" / "witness-key.pem"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch.dict("os.environ", {"METROLOGY_KEY_PASSPHRASE": "strong-test-passphrase"}):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                result = rotation.execute_rotation("encrypted-output-test", pem_path)
+        self.assertEqual(result, 0)
+        self.assertTrue(pem_path.exists())
+        self.assertNotIn("METROLOGY_PRIVATE_KEY", stdout.getvalue())
+        self.assertNotIn("WARNING:", stderr.getvalue())
+
+        registry = json.loads(self.registry_mock.read_text(encoding="utf-8"))
+        public_b64 = registry["keys"]["encrypted-output-test"]["public_key_b64url"]
+        public_raw = base64.urlsafe_b64decode(public_b64 + "=")
+        encrypted = pem_path.read_bytes()
+        loaded = serialization.load_pem_private_key(
+            encrypted, password=b"strong-test-passphrase"
+        )
+        self.assertIsInstance(loaded, ed25519.Ed25519PrivateKey)
+        assert isinstance(loaded, ed25519.Ed25519PrivateKey)
+        derived_public = loaded.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+        self.assertEqual(derived_public, public_raw)
+        raw_private = loaded.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption(),
+        )
+        private_b64 = base64.urlsafe_b64encode(raw_private).rstrip(b"=").decode("ascii")
+        self.assertNotIn(private_b64, stdout.getvalue())
+
+    def test_raw_private_key_output_requires_explicit_opt_in(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            result = rotation.execute_rotation("explicit-output-test", print_private_key=True)
+        self.assertEqual(result, 0)
+        self.assertIn('METROLOGY_PRIVATE_KEY="', stdout.getvalue())
+        self.assertIn("explicitly enabled", stderr.getvalue())
 
 
 if __name__ == "__main__":
