@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Generate Ed25519 witness keys and maintain a versioned public-key registry.
 
-Private material is never written to the repository registry. By default the
-raw private key is printed once as unpadded Base64url for secret injection.
-An optional encrypted PKCS#8 PEM file can be created outside the repository.
+Private material is never written to the repository registry. The default
+operation requires an encrypted PKCS#8 PEM destination. Printing a raw private
+key to stdout is an explicit, opt-in operation for controlled secret injection.
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import json
 import os
 import re
@@ -17,13 +18,21 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TypeGuard, TypeAlias
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 KEY_REGISTRY_PATH = Path("docs/trusted_witness_keys.json")
 _KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+JSONScalar: TypeAlias = str | int | float | bool | None
+JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
+
+
+def _is_json_object(value: object) -> TypeGuard[dict[str, JSONValue]]:
+    """Narrow a decoded JSON object with string keys."""
+    return isinstance(value, dict) and all(isinstance(key, str) for key in value)
 
 
 def _utc_now() -> str:
@@ -55,10 +64,17 @@ def encrypted_pem(private_key_b64url: str, passphrase: str) -> bytes:
     """Serialize a raw Base64url private key as encrypted PKCS#8 PEM."""
     if len(passphrase) < 12:
         raise ValueError("The PEM passphrase must contain at least 12 characters.")
-    padded = private_key_b64url + "=" * (-len(private_key_b64url) % 4)
-    raw_private = base64.urlsafe_b64decode(padded.encode("ascii"))
-    if len(raw_private) != 32:
-        raise ValueError("The raw Ed25519 private key must contain exactly 32 bytes.")
+    try:
+        encoded = private_key_b64url.encode("ascii")
+        raw_private = base64.b64decode(
+            encoded + b"=" * (-len(encoded) % 4),
+            altchars=b"-_",
+            validate=True,
+        )
+    except (UnicodeEncodeError, binascii.Error, ValueError) as exc:
+        raise ValueError("Private key must be canonical Base64url.") from exc
+    if len(raw_private) != 32 or _encode_b64url(raw_private) != private_key_b64url:
+        raise ValueError("The raw Ed25519 private key must be canonical Base64url for 32 bytes.")
     private_key = ed25519.Ed25519PrivateKey.from_private_bytes(raw_private)
     return private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -67,22 +83,22 @@ def encrypted_pem(private_key_b64url: str, passphrase: str) -> bytes:
     )
 
 
-def _load_registry(path: Path) -> dict[str, Any]:
+def _load_registry(path: Path) -> dict[str, JSONValue]:
     if not path.exists():
         return {"metadata": {"schema_version": "1.0"}, "keys": {}}
     try:
         with path.open("r", encoding="utf-8") as registry_file:
             loaded: object = json.load(registry_file)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"Existing public-key registry cannot be read safely: {exc}") from exc
-    if not isinstance(loaded, dict):
+    if not _is_json_object(loaded):
         raise ValueError("Existing public-key registry must be a JSON object.")
-    keys = loaded.get("keys")
-    metadata = loaded.get("metadata")
-    if not isinstance(keys, dict) or not isinstance(metadata, dict):
+    keys_value = loaded.get("keys")
+    metadata_value = loaded.get("metadata")
+    if not _is_json_object(keys_value) or not _is_json_object(metadata_value):
         raise ValueError("Existing public-key registry has an invalid schema.")
-    for existing_id, entry in keys.items():
-        if not isinstance(existing_id, str) or not isinstance(entry, dict):
+    for existing_id, entry in keys_value.items():
+        if not existing_id or not isinstance(entry, dict):
             raise ValueError("Existing public-key registry contains an invalid key entry.")
     return loaded
 
@@ -92,10 +108,13 @@ def update_public_registry(key_id: str, b64url_public_key: str) -> None:
     if not _KEY_ID_PATTERN.fullmatch(key_id):
         raise ValueError("key_id must be 1–128 safe ASCII characters.")
     try:
-        public_bytes = base64.urlsafe_b64decode(
-            (b64url_public_key + "=" * (-len(b64url_public_key) % 4)).encode("ascii")
+        encoded_public_key = b64url_public_key.encode("ascii")
+        public_bytes = base64.b64decode(
+            encoded_public_key + b"=" * (-len(encoded_public_key) % 4),
+            altchars=b"-_",
+            validate=True,
         )
-    except (ValueError, UnicodeEncodeError) as exc:
+    except (ValueError, UnicodeEncodeError, binascii.Error) as exc:
         raise ValueError("Public key must be valid Base64url.") from exc
     if len(public_bytes) != 32 or _encode_b64url(public_bytes) != b64url_public_key:
         raise ValueError("Public key must be a canonical 32-byte Base64url Ed25519 key.")
@@ -115,11 +134,15 @@ def update_public_registry(key_id: str, b64url_public_key: str) -> None:
         os.write(lock_fd, f"pid={os.getpid()}\n".encode("ascii"))
 
         registry = _load_registry(registry_path)
-        keys = registry["keys"]
+        keys_value = registry.get("keys")
+        metadata_value = registry.get("metadata")
+        if not _is_json_object(keys_value) or not _is_json_object(metadata_value):
+            raise ValueError("Existing public-key registry has an invalid schema.")
+        keys = keys_value
+        metadata = metadata_value
         if key_id in keys:
             raise ValueError(f"key_id {key_id!r} already exists; refusing to overwrite it.")
         timestamp = _utc_now()
-        metadata = registry["metadata"]
         metadata["schema_version"] = "1.0"
         metadata["last_rotation_utc"] = timestamp
         keys[key_id] = {
@@ -155,14 +178,26 @@ def update_public_registry(key_id: str, b64url_public_key: str) -> None:
                 pass
 
 
-def execute_rotation(key_id: str | None = None, pem_output: Path | None = None) -> int:
-    """Generate one key and publish only its public half to the registry."""
+def execute_rotation(
+    key_id: str | None = None,
+    pem_output: Path | None = None,
+    print_private_key: bool = False,
+) -> int:
+    """Generate one key and publish its public half without leaking private material."""
+    if pem_output is None and not print_private_key:
+        print(
+            "Refusing to generate a key without a secure destination. "
+            "Use --pem-output with METROLOGY_KEY_PASSPHRASE, or explicitly opt in "
+            "to --print-private-key in a controlled secret-injection session.",
+            file=sys.stderr,
+        )
+        return 2
+
     print("=== METROLOGY: ED25519 WITNESS KEY ROTATION ===")
     timestamp_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     resolved_key_id = key_id or f"metrology-witness-{timestamp_id}-{secrets.token_hex(4)}"
     try:
         private_key, public_key = generate_key_pair(resolved_key_id)
-        pem_bytes: bytes | None = None
         if pem_output is not None:
             passphrase = os.environ.get("METROLOGY_KEY_PASSPHRASE", "")
             pem_bytes = encrypted_pem(private_key, passphrase)
@@ -179,9 +214,15 @@ def execute_rotation(key_id: str | None = None, pem_output: Path | None = None) 
 
     print("\n--- SERVER DEPLOYMENT VALUES ---")
     print(f'METROLOGY_KEY_ID="{resolved_key_id}"')
-    print(f'METROLOGY_PRIVATE_KEY="{private_key}"')
+    if print_private_key:
+        print(
+            "WARNING: raw private key output was explicitly enabled; "
+            "do not retain this terminal or CI log.",
+            file=sys.stderr,
+        )
+        print(f'METROLOGY_PRIVATE_KEY="{private_key}"')
     if pem_output is not None:
-        print(f"Encrypted PEM written to: {pem_output}")
+        print(f"Encrypted private key written to: {pem_output}")
     print("--------------------------------\n")
     return 0
 
@@ -192,10 +233,15 @@ def main() -> int:
     parser.add_argument(
         "--pem-output",
         type=Path,
-        help="Optional encrypted PKCS#8 PEM destination (must not already exist).",
+        help="Encrypted PKCS#8 PEM destination (must not already exist).",
+    )
+    parser.add_argument(
+        "--print-private-key",
+        action="store_true",
+        help="UNSAFE opt-in: print the raw private key to stdout for controlled secret injection.",
     )
     args = parser.parse_args()
-    return execute_rotation(args.key_id, args.pem_output)
+    return execute_rotation(args.key_id, args.pem_output, args.print_private_key)
 
 
 if __name__ == "__main__":
