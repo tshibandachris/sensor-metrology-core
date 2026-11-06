@@ -367,12 +367,13 @@ class RemoteTrustRequestHandler(BaseHTTPRequestHandler):
         if set(request) != expected_fields:
             self._send(400, {"error": "invalid_schema"})
             return
+        request_sequence = request.get("sequence")
         if (
             type(request.get("protocol_version")) is not int
             or request["protocol_version"] != 1
             or request.get("target_id") != target_id
-            or type(request.get("sequence")) is not int
-            or request["sequence"] < 1
+            or type(request_sequence) is not int
+            or request_sequence < 1
         ):
             self._send(400, {"error": "invalid_fields"})
             return
@@ -436,7 +437,10 @@ def build_server(
 
 def main() -> None:
     server = build_server()
-    print(f"Remote trust witness listening on {server.server_address[0]}:{server.server_address[1]}")
+    host, port = server.server_address[:2]
+    if not isinstance(host, str) or type(port) is not int:
+        raise RuntimeError("HTTP server returned an invalid bind address.")
+    print(f"Remote trust witness listening on {host}:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
