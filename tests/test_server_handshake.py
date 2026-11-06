@@ -83,6 +83,10 @@ class ServerTLSHandshakeTests(unittest.TestCase):
             server_thread = threading.Thread(target=server.serve_forever, daemon=True)
             server_thread.start()
             try:
+                self.assertEqual(
+                    server.socket.context.minimum_version,
+                    ssl.TLSVersion.TLSv1_2,
+                )
                 client_tls_context = ssl.create_default_context(cafile=str(certificate_path))
                 client_tls_context.check_hostname = False
                 client = RemoteTrustBridge(
@@ -105,6 +109,15 @@ class ServerTLSHandshakeTests(unittest.TestCase):
                 server.server_close()
                 server_thread.join(timeout=5)
                 self.assertFalse(server_thread.is_alive(), "TLS witness server did not stop cleanly.")
+
+    def test_non_loopback_bind_requires_tls(self) -> None:
+        with self.assertRaisesRegex(ValueError, "TLS is required"):
+            build_server(
+                host="0.0.0.0",
+                port=0,
+                auth_token="production-config-test",
+                private_key_value="not-needed-before-bind-validation",
+            )
 
 
 if __name__ == "__main__":
