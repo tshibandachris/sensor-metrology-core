@@ -263,6 +263,26 @@ class RemoteTrustOutboxTests(unittest.TestCase):
         self.assertIn("remote_target_id", columns)
         self.assertEqual(migrated.verify(), 0)
 
+    def test_verify_rejects_orphaned_outbox_rows(self) -> None:
+        # Simulate an out-of-band writer that did not enable SQLite foreign keys.
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                """
+                INSERT INTO remote_checkpoint_outbox (
+                    sequence, previous_hash, record_hash, chain_hash,
+                    idempotency_key, status
+                ) VALUES (999, ?, ?, ?, ?, 'pending')
+                """,
+                ("0" * 64, "1" * 64, "2" * 64, "orphaned-outbox-row"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(IntegrityError):
+            self.ledger.verify()
+
     def test_remote_outbox_is_opt_in_for_existing_ledger(self) -> None:
         disabled = TransactionalLedgerManager(
             Path(self.temp_dir.name) / "disabled.sqlite3",
