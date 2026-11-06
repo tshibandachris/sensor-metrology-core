@@ -14,10 +14,13 @@ import hmac
 import json
 import os
 import sqlite3
-from datetime import datetime
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
+from remote_trust_bridge import VerifiedChainHead
 from chronological_ledger import (
     GENESIS_HASH,
     SCHEMA_VERSION,
@@ -36,6 +39,20 @@ from chronological_ledger import (
 AppendResult = Literal["appended", "already_exists"]
 
 
+class RemoteCheckpointPendingError(RuntimeError):
+    """Raised when another local append is waiting for remote anchoring."""
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteCheckpointOutboxItem:
+    sequence: int
+    previous_hash: str
+    record_hash: str
+    chain_hash: str
+    idempotency_key: str
+    attempt_count: int
+
+
 def _chain_hash(previous_hash: str, record_hash: str) -> str:
     return hashlib.sha256(
         f"{previous_hash}:{record_hash}".encode("ascii")
@@ -50,6 +67,7 @@ class TransactionalLedgerManager:
         database_path: Path,
         hmac_secret: bytes | None = None,
         timeout_seconds: float = 30.0,
+        remote_checkpointing: bool = False,
     ) -> None:
         if hmac_secret is None:
             configured = os.environ.get("METROLOGY_SIGNING_KEY")
@@ -66,6 +84,8 @@ class TransactionalLedgerManager:
         self._timeout_seconds = timeout_seconds
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+        if remote_checkpointing:
+            self.enable_remote_outbox()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -126,8 +146,49 @@ class TransactionalLedgerManager:
                 BEGIN
                     SELECT RAISE(ABORT, 'ledger records are append-only');
                 END;
+
+                CREATE TABLE IF NOT EXISTS remote_checkpoint_config (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                    remote_target_id TEXT
+                );
+
+                INSERT OR IGNORE INTO remote_checkpoint_config (singleton, enabled)
+                VALUES (1, 0);
+
+                CREATE TABLE IF NOT EXISTS remote_checkpoint_outbox (
+                    sequence INTEGER PRIMARY KEY
+                        REFERENCES ledger_records(sequence),
+                    previous_hash TEXT NOT NULL,
+                    record_hash TEXT NOT NULL,
+                    chain_hash TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL CHECK (status IN ('pending', 'delivered')),
+                    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+                    checkpoint_id TEXT,
+                    delivered_at TEXT,
+                    last_error TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS remote_checkpoint_outbox_pending
+                ON remote_checkpoint_outbox(status, sequence);
                 """
             )
+            # Serialize schema inspection and migration across independent
+            # processes. Without this writer lock, two first-open processes can
+            # both observe the old schema and race the same ALTER TABLE.
+            connection.execute("BEGIN IMMEDIATE")
+            config_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(remote_checkpoint_config)"
+                ).fetchall()
+            }
+            if "remote_target_id" not in config_columns:
+                connection.execute(
+                    "ALTER TABLE remote_checkpoint_config ADD COLUMN remote_target_id TEXT"
+                )
+            connection.execute("COMMIT")
         finally:
             connection.close()
 
@@ -243,6 +304,22 @@ class TransactionalLedgerManager:
                     "Composite key already exists with different business payload."
                 )
 
+            remote_enabled_row = connection.execute(
+                "SELECT enabled FROM remote_checkpoint_config WHERE singleton = 1"
+            ).fetchone()
+            if remote_enabled_row is None or remote_enabled_row["enabled"] not in (0, 1):
+                raise IntegrityError("Remote checkpoint configuration row is missing or invalid.")
+            remote_enabled = remote_enabled_row["enabled"] == 1
+            if remote_enabled:
+                pending = connection.execute(
+                    "SELECT sequence FROM remote_checkpoint_outbox "
+                    "WHERE status = 'pending' ORDER BY sequence LIMIT 1"
+                ).fetchone()
+                if pending is not None:
+                    raise RemoteCheckpointPendingError(
+                        "A remote checkpoint is pending; synchronize it before appending."
+                    )
+
             duplicate_id = connection.execute(
                 "SELECT 1 FROM ledger_records WHERE record_id = ?",
                 (record_id,),
@@ -294,7 +371,7 @@ class TransactionalLedgerManager:
             signature = self._signature(chain_hash)
             record_json = _canonical_json(record).decode("utf-8")
 
-            connection.execute(
+            inserted = connection.execute(
                 """
                 INSERT INTO ledger_records (
                     record_id, record_type, target_id, execution_version,
@@ -317,6 +394,26 @@ class TransactionalLedgerManager:
                     signature,
                 ),
             )
+            if remote_enabled:
+                sequence = inserted.lastrowid
+                if sequence is None:
+                    raise IntegrityError("SQLite did not return the inserted ledger sequence.")
+                connection.execute(
+                    """
+                    INSERT INTO remote_checkpoint_outbox (
+                        sequence, previous_hash, record_hash, chain_hash,
+                        idempotency_key, status
+                    ) VALUES (?, ?, ?, ?, ?, 'pending')
+                    """,
+                    (
+                        sequence,
+                        previous_hash,
+                        record_hash,
+                        chain_hash,
+                        uuid.uuid4().hex,
+                    ),
+                )
+
             connection.execute(
                 """
                 UPDATE ledger_meta
@@ -327,6 +424,223 @@ class TransactionalLedgerManager:
             )
             connection.execute("COMMIT")
             return "appended"
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+
+    def enable_remote_outbox(self) -> int:
+        """Enable durable remote anchoring and enqueue every existing record.
+
+        The backfill and enable flag commit together. Repeated calls are safe:
+        already-enqueued records retain their original idempotency keys.
+        """
+        self.verify()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE remote_checkpoint_config SET enabled = 1 WHERE singleton = 1"
+            )
+            rows = connection.execute(
+                "SELECT sequence, previous_hash, record_hash, chain_hash "
+                "FROM ledger_records ORDER BY sequence"
+            ).fetchall()
+            added = 0
+            for row in rows:
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO remote_checkpoint_outbox (
+                        sequence, previous_hash, record_hash, chain_hash,
+                        idempotency_key, status
+                    ) VALUES (?, ?, ?, ?, ?, 'pending')
+                    """,
+                    (
+                        row["sequence"],
+                        row["previous_hash"],
+                        row["record_hash"],
+                        row["chain_hash"],
+                        uuid.uuid4().hex,
+                    ),
+                )
+                added += max(cursor.rowcount, 0)
+            connection.execute("COMMIT")
+            return added
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def bind_remote_target(self, remote_target_id: str) -> None:
+        """Permanently bind this ledger's remote stream to one witness target."""
+        if (
+            not isinstance(remote_target_id, str)
+            or not remote_target_id.strip()
+            or len(remote_target_id) > 256
+        ):
+            raise ValueError("remote_target_id must contain 1 to 256 characters.")
+        target = remote_target_id.strip()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            config = connection.execute(
+                "SELECT enabled, remote_target_id FROM remote_checkpoint_config "
+                "WHERE singleton = 1"
+            ).fetchone()
+            if config is None or config["enabled"] != 1:
+                raise IntegrityError("Remote checkpoint outbox is not enabled.")
+            existing = config["remote_target_id"]
+            if existing is None:
+                connection.execute(
+                    "UPDATE remote_checkpoint_config SET remote_target_id = ? "
+                    "WHERE singleton = 1 AND remote_target_id IS NULL",
+                    (target,),
+                )
+            elif existing != target:
+                raise IntegrityError(
+                    "This local ledger is already bound to a different remote target."
+                )
+            connection.execute("COMMIT")
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def get_remote_checkpoint_state(
+        self,
+    ) -> tuple[int, str, RemoteCheckpointOutboxItem | None]:
+        """Return the local head and earliest pending remote checkpoint."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            config = connection.execute(
+                "SELECT enabled, remote_target_id FROM remote_checkpoint_config "
+                "WHERE singleton = 1"
+            ).fetchone()
+            if (
+                config is None
+                or config["enabled"] != 1
+                or not isinstance(config["remote_target_id"], str)
+                or not config["remote_target_id"]
+            ):
+                raise ValueError("Remote checkpoint outbox is not enabled and bound.")
+            meta = connection.execute(
+                "SELECT head_hash, record_count FROM ledger_meta WHERE singleton = 1"
+            ).fetchone()
+            if meta is None or not isinstance(meta["head_hash"], str):
+                raise IntegrityError("Ledger metadata row is missing or invalid.")
+            pending = connection.execute(
+                """
+                SELECT sequence, previous_hash, record_hash, chain_hash,
+                       idempotency_key, attempt_count
+                FROM remote_checkpoint_outbox
+                WHERE status = 'pending'
+                ORDER BY sequence
+                LIMIT 1
+                """
+            ).fetchone()
+            item: RemoteCheckpointOutboxItem | None = None
+            if pending is not None:
+                item = RemoteCheckpointOutboxItem(
+                    sequence=int(pending["sequence"]),
+                    previous_hash=str(pending["previous_hash"]),
+                    record_hash=str(pending["record_hash"]),
+                    chain_hash=str(pending["chain_hash"]),
+                    idempotency_key=str(pending["idempotency_key"]),
+                    attempt_count=int(pending["attempt_count"]),
+                )
+            connection.execute("COMMIT")
+            return int(meta["record_count"]), meta["head_hash"], item
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def record_remote_checkpoint_failure(self, sequence: int, error: str) -> None:
+        """Persist a bounded diagnostic while retaining the exact pending request."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE remote_checkpoint_outbox
+                SET attempt_count = attempt_count + 1, last_error = ?
+                WHERE sequence = ? AND status = 'pending'
+                """,
+                (error[:1000], sequence),
+            )
+            if cursor.rowcount != 1:
+                raise IntegrityError("Pending remote checkpoint was not found.")
+            connection.execute("COMMIT")
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def mark_remote_checkpoint_delivered(self, receipt: VerifiedChainHead) -> None:
+        """Mark delivery only from a verified receipt matching the persisted request."""
+        if (
+            not isinstance(receipt, VerifiedChainHead)
+            or receipt.sequence < 1
+            or not receipt.checkpoint_id
+            or len(receipt.checkpoint_id) > 256
+            or receipt.previous_hash is None
+            or receipt.record_hash is None
+        ):
+            raise ValueError("A verified checkpoint receipt is required.")
+        delivered_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
+            "+00:00", "Z"
+        )
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT o.status, o.checkpoint_id, o.previous_hash, o.record_hash,
+                       o.chain_hash, c.remote_target_id
+                FROM remote_checkpoint_outbox AS o
+                JOIN remote_checkpoint_config AS c ON c.singleton = 1
+                WHERE o.sequence = ?
+                """,
+                (receipt.sequence,),
+            ).fetchone()
+            if row is None:
+                raise IntegrityError("Remote checkpoint outbox entry was not found.")
+            if (
+                row["remote_target_id"] != receipt.target_id
+                or row["previous_hash"] != receipt.previous_hash
+                or row["record_hash"] != receipt.record_hash
+                or row["chain_hash"] != receipt.chain_hash
+            ):
+                raise IntegrityError("Verified receipt does not match the bound outbox entry.")
+            if row["status"] == "delivered":
+                if row["checkpoint_id"] != receipt.checkpoint_id:
+                    raise IntegrityError("Remote checkpoint receipt conflicts with stored receipt.")
+                connection.execute("COMMIT")
+                return
+            cursor = connection.execute(
+                """
+                UPDATE remote_checkpoint_outbox
+                SET status = 'delivered', checkpoint_id = ?, delivered_at = ?,
+                    last_error = NULL
+                WHERE sequence = ? AND status = 'pending'
+                """,
+                (receipt.checkpoint_id, delivered_at, receipt.sequence),
+            )
+            if cursor.rowcount != 1:
+                raise IntegrityError("Remote checkpoint delivery state changed unexpectedly.")
+            connection.execute("COMMIT")
         except Exception:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
@@ -349,6 +663,13 @@ class TransactionalLedgerManager:
             integrity_result = connection.execute("PRAGMA integrity_check").fetchone()
             if integrity_result is None or integrity_result[0] != "ok":
                 raise IntegrityError("SQLite database integrity check failed.")
+            foreign_key_violation = connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchone()
+            if foreign_key_violation is not None:
+                raise IntegrityError(
+                    "SQLite database contains a foreign-key violation."
+                )
             rows = connection.execute(
                 "SELECT * FROM ledger_records ORDER BY sequence"
             ).fetchall()
@@ -494,6 +815,67 @@ class TransactionalLedgerManager:
                 expected_head_hash, previous_hash
             ):
                 raise IntegrityError("Ledger head differs from external expected hash.")
+
+            remote_config = connection.execute(
+                "SELECT enabled FROM remote_checkpoint_config WHERE singleton = 1"
+            ).fetchone()
+            if remote_config is None or remote_config["enabled"] not in (0, 1):
+                raise IntegrityError("Remote checkpoint configuration row is missing or invalid.")
+            outbox_rows = connection.execute(
+                """
+                SELECT r.sequence, r.previous_hash AS ledger_previous_hash,
+                       r.record_hash AS ledger_record_hash,
+                       r.chain_hash AS ledger_chain_hash,
+                       o.sequence AS outbox_sequence,
+                       o.previous_hash, o.record_hash, o.chain_hash,
+                       o.idempotency_key, o.status, o.attempt_count,
+                       o.checkpoint_id, o.delivered_at
+                FROM ledger_records AS r
+                LEFT JOIN remote_checkpoint_outbox AS o ON o.sequence = r.sequence
+                ORDER BY r.sequence
+                """
+            ).fetchall()
+            if remote_config["enabled"] == 0 and any(
+                row["outbox_sequence"] is not None for row in outbox_rows
+            ):
+                raise IntegrityError("Disabled remote outbox contains checkpoint rows.")
+            if remote_config["enabled"] == 1 and len(outbox_rows) != len(rows):
+                raise IntegrityError("Remote outbox does not cover the complete ledger.")
+            pending_seen = False
+            for expected_sequence, outbox_row in enumerate(outbox_rows, start=1):
+                if remote_config["enabled"] == 0:
+                    break
+                if (
+                    outbox_row["outbox_sequence"] != expected_sequence
+                    or outbox_row["previous_hash"] != outbox_row["ledger_previous_hash"]
+                    or outbox_row["record_hash"] != outbox_row["ledger_record_hash"]
+                    or outbox_row["chain_hash"] != outbox_row["ledger_chain_hash"]
+                    or not isinstance(outbox_row["idempotency_key"], str)
+                    or not outbox_row["idempotency_key"]
+                    or type(outbox_row["attempt_count"]) is not int
+                    or outbox_row["attempt_count"] < 0
+                ):
+                    raise IntegrityError(
+                        f"Remote outbox entry is inconsistent at sequence {expected_sequence}."
+                    )
+                if outbox_row["status"] == "pending":
+                    pending_seen = True
+                    if (
+                        outbox_row["checkpoint_id"] is not None
+                        or outbox_row["delivered_at"] is not None
+                    ):
+                        raise IntegrityError("Pending remote checkpoint has delivery metadata.")
+                elif outbox_row["status"] == "delivered":
+                    if pending_seen:
+                        raise IntegrityError("Remote outbox delivery order contains a gap.")
+                    if (
+                        not isinstance(outbox_row["checkpoint_id"], str)
+                        or not outbox_row["checkpoint_id"]
+                        or not isinstance(outbox_row["delivered_at"], str)
+                    ):
+                        raise IntegrityError("Delivered remote checkpoint lacks receipt metadata.")
+                else:
+                    raise IntegrityError("Remote outbox contains an unknown status.")
 
             connection.execute("COMMIT")
             return len(rows)

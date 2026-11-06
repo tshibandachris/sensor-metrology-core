@@ -1,1 +1,2 @@
-# No third-party runtime dependencies.\n
+# Runtime dependency for Ed25519 signature verification.
+cryptography>=44.0.0,<48.0.0
