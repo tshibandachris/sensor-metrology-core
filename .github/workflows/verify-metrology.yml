@@ -55,7 +55,11 @@ jobs:
         run: |
           mypy --strict chronological_ledger.py transactional_ledger.py remote_trust_bridge.py remote_trust_outbox.py sensor_trust_server.py tests/test_server_communication.py tests/test_server_handshake.py tests/test_ledger_integrity.py tests/test_transactional_ledger.py tests/remote_trust_stub.py tests/test_remote_trust.py tests/test_remote_trust_outbox.py tests/test_multiprocess_recovery.py
 
-      - name: Mandatory rotation utility strict typing gate\n        run: |\n          mypy --strict rotate_witness_keys.py tests/test_key_rotation.py\n\n      - name: Mandatory auditor strict typing gate
+      - name: Mandatory rotation utility strict typing gate
+        run: |
+          mypy --strict rotate_witness_keys.py tests/test_key_rotation.py
+
+      - name: Mandatory auditor strict typing gate
         run: |
           mypy --strict sensor_integrity_auditor.py
 
