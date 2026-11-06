@@ -59,6 +59,10 @@ jobs:
         run: |
           mypy --strict rotate_witness_keys.py tests/test_key_rotation.py
 
+      - name: Mandatory witness key loader strict typing gate
+        run: |
+          mypy --strict witness_key_loader.py
+
       - name: Mandatory auditor strict typing gate
         run: |
           mypy --strict sensor_integrity_auditor.py
