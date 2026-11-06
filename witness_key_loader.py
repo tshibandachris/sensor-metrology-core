@@ -110,4 +110,9 @@ class WitnessKeyLoader:
         if entry_value.get("revoked", False) is True:
             raise KeyRevokedError(f"Witness key {key_id!r} has been revoked.")
 
-        return self._decode_public_key(entry_value["public_key_b64url"], key_id)
+        encoded_public_key = entry_value.get("public_key_b64url")
+        if not isinstance(encoded_public_key, str):
+            raise KeyRegistryFormatError(
+                f"Witness key entry {key_id!r} has no textual public key."
+            )
+        return self._decode_public_key(encoded_public_key, key_id)
