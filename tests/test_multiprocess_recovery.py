@@ -32,7 +32,9 @@ def _crash_before_sqlite_commit(database_path: str, ready: Any) -> None:
 
 def _commit_then_crash(database_path: str) -> None:
     manager = TransactionalLedgerManager(
-        Path(database_path), hmac_secret=TEST_SECRET
+        Path(database_path),
+        hmac_secret=TEST_SECRET,
+        remote_checkpointing=True,
     )
     manager.append_baseline(
         record_id="committed-before-crash",
@@ -105,6 +107,7 @@ class MultiprocessRecoveryTests(unittest.TestCase):
         self.assertFalse(process.is_alive(), "Commit worker did not exit.")
         self.assertEqual(process.exitcode, 0)
         self.assertEqual(self.ledger.verify(), 1)
+        self.ledger.bind_remote_target("ledger-crash-test")
         state = self.ledger.get_remote_checkpoint_state()
         self.assertEqual(state[0], 1)
         self.assertIsNotNone(state[2])
