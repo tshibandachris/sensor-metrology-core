@@ -137,6 +137,39 @@ remote commit but before the client receives or stores the receipt.
 
 ## Security and operational requirements
 
+The bundled Python witness is a minimal reference service, not a complete
+internet-facing deployment. Its startup policy is fail-closed: without TLS
+certificate and key paths it may bind only to a loopback address. Any other
+bind address requires both `METROLOGY_TLS_CERT` and `METROLOGY_TLS_KEY`.
+The TLS listener enforces TLS 1.2 or newer. Use a certificate chain issued by
+a trusted CA for the public service name, protect the private key with
+least-privilege filesystem permissions, and renew it before expiry. A
+self-signed certificate is appropriate only for controlled tests where the
+client explicitly trusts that certificate.
+
+Recommended production environment:
+
+- `SERVER_HOST`: the intended service interface (or keep the Python service
+  loopback-only behind a hardened TLS reverse proxy).
+- `SERVER_PORT`: the service port; expose it only through the approved
+  firewall/reverse-proxy path.
+- `METROLOGY_TLS_CERT`: PEM certificate chain, including intermediates.
+- `METROLOGY_TLS_KEY`: matching PEM private key, readable only by the service
+  identity.
+- `SERVER_AUTH_TOKEN`: high-entropy, target-scoped credential injected by a
+  secret manager; never place it in source control or command-line arguments.
+- `METROLOGY_PRIVATE_KEY`: Ed25519 signing key injected from a protected
+  secret store or KMS/HSM-backed signing adapter.
+- `METROLOGY_DATABASE`: persistent database path on a durable, access-
+  controlled volume with tested backup and restore procedures.
+
+For deployments that terminate TLS at a reverse proxy, bind this service to
+loopback and configure the proxy to reject cleartext external traffic, avoid
+forwarding untrusted client headers, enforce request limits and rate limits,
+and restrict access to the upstream listener. Do not expose the built-in
+server directly to the public internet without independent operational
+controls.
+
 - Ed25519 signing keys are held by the remote service in a KMS/HSM or
   equivalently protected signing boundary; private signing keys are never
   distributed to clients.
