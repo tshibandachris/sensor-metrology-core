@@ -174,6 +174,10 @@ class TransactionalLedgerManager:
                 ON remote_checkpoint_outbox(status, sequence);
                 """
             )
+            # Serialize schema inspection and migration across independent
+            # processes. Without this writer lock, two first-open processes can
+            # both observe the old schema and race the same ALTER TABLE.
+            connection.execute("BEGIN IMMEDIATE")
             config_columns = {
                 str(row["name"])
                 for row in connection.execute(
@@ -184,6 +188,7 @@ class TransactionalLedgerManager:
                 connection.execute(
                     "ALTER TABLE remote_checkpoint_config ADD COLUMN remote_target_id TEXT"
                 )
+            connection.execute("COMMIT")
         finally:
             connection.close()
 
@@ -658,6 +663,13 @@ class TransactionalLedgerManager:
             integrity_result = connection.execute("PRAGMA integrity_check").fetchone()
             if integrity_result is None or integrity_result[0] != "ok":
                 raise IntegrityError("SQLite database integrity check failed.")
+            foreign_key_violation = connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchone()
+            if foreign_key_violation is not None:
+                raise IntegrityError(
+                    "SQLite database contains a foreign-key violation."
+                )
             rows = connection.execute(
                 "SELECT * FROM ledger_records ORDER BY sequence"
             ).fetchall()
