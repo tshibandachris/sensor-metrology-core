@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -109,6 +110,7 @@ class RemoteTrustBridge:
         target_id: str | None = None,
         trusted_public_keys: Mapping[str, bytes] | None = None,
         timeout_seconds: float = 5.0,
+        ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         self.base_url = (base_url or os.environ.get("REMOTE_TRUST_BASE_URL", "")).rstrip("/")
         self.token = token or os.environ.get("REMOTE_TRUST_TOKEN", "")
@@ -165,7 +167,12 @@ class RemoteTrustBridge:
                 raise ValueError("Each trusted key needs a key_id and 32 raw bytes.")
             self._public_keys[key_id] = Ed25519PublicKey.from_public_bytes(raw_key)
 
-        self._opener = urllib.request.build_opener(_NoRedirect())
+        if ssl_context is None:
+            self._opener = urllib.request.build_opener(_NoRedirect())
+        else:
+            self._opener = urllib.request.build_opener(
+                _NoRedirect(), urllib.request.HTTPSHandler(context=ssl_context)
+            )
 
     def _request(self, method: str, endpoint: str, body: bytes | None = None) -> object:
         url = f"{self.base_url}{endpoint}"
