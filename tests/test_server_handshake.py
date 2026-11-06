@@ -88,7 +88,6 @@ class ServerTLSHandshakeTests(unittest.TestCase):
                     ssl.TLSVersion.TLSv1_2,
                 )
                 client_tls_context = ssl.create_default_context(cafile=str(certificate_path))
-                client_tls_context.check_hostname = False
                 client = RemoteTrustBridge(
                     base_url=f"https://127.0.0.1:{server.server_address[1]}",
                     token="tls-integration-secret",
