@@ -10,6 +10,7 @@ import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import cast
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -84,7 +85,7 @@ class ServerTLSHandshakeTests(unittest.TestCase):
             server_thread.start()
             try:
                 self.assertEqual(
-                    server.socket.context.minimum_version,
+                    cast(ssl.SSLSocket, server.socket).context.minimum_version,
                     ssl.TLSVersion.TLSv1_2,
                 )
                 client_tls_context = ssl.create_default_context(cafile=str(certificate_path))
